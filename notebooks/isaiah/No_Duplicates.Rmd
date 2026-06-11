@@ -1,0 +1,192 @@
+---
+title: "Finger Hut (Feature Engineering)"
+author: "Isaiah C. Mireles"
+date: "2026-04-06"
+output: html_document
+---
+
+# Task 0 – Fingerhut
+
+[Generated GPT](https://chatgpt.com/g/g-69cee2d550f4819195683c49639b978c-fingerhut-gpt)
+
+[Course Notes](https://docs.google.com/document/d/1k-IZ0ObDrfif1OiEVqaGXPZ5CbQxXZzn_GQ0rBYsBRE/edit?usp=sharing)
+
+# Task 1 – Read data
+
+```{r}
+getwd()
+setwd("/Users/isaiahmireles/Desktop/FingerHut")
+df <- read.csv("dat_train1.csv")
+df |> head()
+df |> str()
+```
+
+## Generate Date Features – `date` and `dt_time`
+
+```{r shushh, message=FALSE}
+df$date <- as.Date(df$event_timestamp) #only dt not time -- dt obj
+```
+
+-   notice this is in `UTC time` – so universal time
+
+```{r}
+df$dt_tm <- as.POSIXct(df$event_timestamp, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+```
+
+If we assume *mostly* everyone is from the US it seems like we have about a 3hr range on time
+
+-   of course ignoring alaska and hawaii as we will also assume that probably these make up a small percent of orders.
+
+![](images/timezones-us.webp)
+
+```{r}
+df |> select(contains("id"), -ed_id) |> head(2)
+```
+
+-   notice `id` feature is just **`customer_id account_id`**
+
+```{r}
+n_distinct_id <- df |> distinct(id) |> nrow()
+n_distinct_cust_act <- df |> distinct(customer_id, account_id) |> nrow()
+n_distinct_act_cust <- df |> distinct(account_id, customer_id) |> nrow()
+n_rw <- df |> nrow()
+n_distinct_id
+n_distinct_cust_act
+n_distinct_act_cust
+n_rw
+
+round(n_distinct_act_cust/n_rw, 2)
+```
+
+## many-to-one / one-to-many problem
+
+-   notice that there may be **multiple people** to **one account** and,
+
+```{r multi_customers_per_account, message = F}
+library(dplyr)
+multi_customers_per_account <- df %>%
+  distinct(customer_id, account_id) %>%
+  group_by(account_id) %>%
+  summarise(n_customers = n()) %>%
+  filter(n_customers > 1)
+
+# count how many such accounts
+nrow(multi_customers_per_account)
+
+# relative importance : negligible issue : frac of pct -- abt 0%
+round(nrow(multi_customers_per_account)/df %>%
+  distinct(customer_id, account_id) |> nrow(), 5)
+```
+
+-   **multiple accounts** to **one person**
+
+```{r}
+multi_accts_per_customer <- df %>%
+  distinct(customer_id, account_id) %>%   # remove duplicate rows first
+  group_by(customer_id) %>%
+  summarise(n_accounts = n()) %>%
+  filter(n_accounts > 1)
+
+# count how many such customers
+nrow(multi_accts_per_customer)
+
+
+# relative importance : almost negligible issue : 3%
+round(nrow(multi_accts_per_customer)/df |> 
+  distinct(customer_id, account_id) |> nrow(), 5)
+```
+
+1.  How many rows does your data set have?
+
+```{r}
+n_rw
+```
+
+2.  How many unqiue Ids are there?
+
+```{r}
+length(unique(df$id))
+
+# many entries from the same person (makes sense given journey)
+length(unique(df$id))/n_rw
+```
+
+3.  What is the earliest and latest time stamp?
+
+```{r}
+set.seed(123)
+samp <- sample(df$event_timestamp, 3); samp
+```
+
+[Time Type]{.underline} : ISO 8601 format
+
+`%Y-%m-%dT%H:%M:%SZ`
+
+| Component | Meaning           |
+|-----------|-------------------|
+| `%Y`      | 4-digit year      |
+| `%m`      | month             |
+| `%d`      | day               |
+| `T`       | literal separator |
+| `%H`      | hour (24h)        |
+| `%M`      | minute            |
+| `%S`      | second            |
+| `Z`       | UTC timezone      |
+
+stands for the "Zero" timezone, which indicates Coordinated Universal Time (UTC)
+
+[What tf is UTC time?](https://www.youtube.com/watch?v=o8LnkD1hOFQ) (YouTube)
+
+```{r}
+range(df$dt_tm)
+```
+
+-   earliest entry : 2020-11-03 03:31:30 UTC
+
+# Task 2 – Remove Duplicates
+
+Duplicate entries are entries where the same user logs the same action at the same time. Make sure that you fix the action counter after deleting the duplicates. Make sure that you fix the action counter after deleting the duplicates.
+
+```{r}
+df <- df %>%
+  distinct(id, dt_tm, event_name, .keep_all = TRUE)
+```
+
+-   For a unique `id`, `dt_tm`, and `event_name` it keeps the first row observation
+
+```{r}
+nrw2 <- df |> nrow()
+n_dup <- n_rw-nrw2; n_dup
+prop_dup <- round(nrw2/n_rw, 2); prop_dup
+1-prop_dup
+```
+
+1.  How many entries are duplicates? Total number and proportion.
+
+-   Number of duplicates : 31,121,100
+
+-   proportion : 6% were duplicates
+
+2.  Number of rows left : 51,848,861
+
+# Update : `journey_steps_until_end`
+
+```{r}
+# ed_id -- event_name pairs
+ed_id_dictionary <- df |> distinct(event_name, ed_id) |> arrange(ed_id)
+ed_id_dictionary
+
+# equal length
+length(unique(df$ed_id)) == length(unique(df$event_name))
+```
+
+```{r}
+df <- df %>%
+  group_by(id) %>%
+  mutate(journey_steps_until_end = n_distinct(event_name)) %>%
+  ungroup()
+```
+
+```{r}
+
+```

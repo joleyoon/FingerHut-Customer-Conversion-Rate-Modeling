@@ -1,0 +1,648 @@
+---
+title: "Sampling New Data"
+author: "Isaiah C. Mireles"
+date: "2026-05-26"
+output: html_document
+---
+
+```{r}
+dt <- fread("dat_train2.csv")
+```
+
+# Init. inspection and clean
+
+```{r}
+#| label: init inspection
+
+# checking duplicates
+
+sum(duplicated(dt, by=c("id", "event_timestamp", "event_name"), fromLast = TRUE))
+sum(duplicated(dt, by=c("id", "event_timestamp", "event_name", "journey_steps_until_end"), fromLast = TRUE))
+
+# there are (~3mil) duplicate events taken by same user at same time, but they are registered as separate actions (i.e. "double clicks")
+
+# let's investigate:
+
+# ensure temporal order
+setorder(dt, id, event_timestamp)
+
+idx_duped <- duplicated(dt, by=c("id", "event_timestamp", "event_name"), fromLast = TRUE)
+
+# 1. Create a reference table of the duplicate keys
+dupe_keys <- dt[idx_duped, .(id, event_timestamp, event_name)]
+
+# 2. Use a join to pull all records matching those keys
+verification_sample <- dt[dupe_keys, on = .(id, event_timestamp, event_name)]
+
+# 3. View the first few sets
+head(verification_sample[order(id, event_timestamp)], 10)
+
+
+# Missing value summary
+na_summary <- dt[, lapply(.SD, \(x) sum(is.na(x)))] |>
+  melt(
+    measure.vars = names(dt),
+    variable.name = "column",
+    value.name = "na_count"
+  )
+na_summary[, pct_missing := round((na_count / nrow(dt)) * 100, 2)]
+na_summary
+
+# no missing values!
+
+# drop duplicates:
+dt <- unique(dt, by=c("id", "event_timestamp", "event_name"))
+
+# drop redundant / unused columns
+dt <- dt[,-c("customer_id", "account_id", "journey_steps_until_end", "sep")]
+```
+
+# create user outcome dt
+
+```{r}
+#| label: create user outcome dt
+train_cutoff_ts <- max(dt$event_timestamp)
+
+user_outcomes <- dt[,
+  .(
+    has_shipped = any(ed_id == 28),
+    last_ts = max(event_timestamp)
+  ),
+  by = id
+]
+
+user_outcomes[,
+  days_inactive := as.integer(difftime(
+    train_cutoff_ts,
+    last_ts,
+    units = "days"
+  ))
+]
+user_outcomes[,
+  final_outcome := fcase(
+    has_shipped == TRUE , "success" ,
+    days_inactive >= 60  , "failure" ,
+    default = "incomplete"
+  )
+]
+
+table(user_outcomes$final_outcome)
+
+# Keep only the essential mapping
+user_outcomes <- user_outcomes[, .(id, final_outcome)]
+```
+
+# Save cleaned dat
+
+```{r}
+#| label: save data
+
+write_parquet(dt, 'dt_clean2.parquet')
+write_parquet(user_outcomes, "user_outcomes2.parquet")
+```
+
+# Separate Complete and Incomplete (test and train) Users
+
+```{r}
+#| label: separate complete and incomplete users
+
+# test_ids <- user_outcomes[final_outcome == "incomplete", id]
+test_ids <- open_template$id
+# train_ids <- user_outcomes[final_outcome != "incomplete", id]
+train_ids <- setdiff(user_outcomes$id, test_ids)
+```
+
+# Define flattening function
+
+```{r}
+#| label: flatten function
+flatten_journey <- function(events_dt) {
+	setorder(events_dt, id, event_timestamp)
+
+	# OPTIMIZATION 2: Create temporary integer columns for fast math.
+	# This leaves original event_timestamp completely untouched for later use
+	events_dt[, ts_int := as.integer(event_timestamp)]
+	events_dt[, cutoff_int := as.integer(cutoff_time)]
+
+	# OPTIMIZATION 3: Vectorize the gaps globally.
+	# Calculating shift() inside a grouped block is slow. Doing it here is near-instant.
+	events_dt[, gap_s := ts_int - shift(ts_int), by = id]
+
+	# 1. Grouped Feature Engineering
+	summary_dt <- events_dt[,
+		{
+			first_ts <- event_timestamp[1]
+			last_ts <- event_timestamp[.N]
+
+			first_ts_int <- ts_int[1]
+			last_ts_int <- ts_int[.N]
+			user_cutoff_int <- cutoff_int[1]
+
+			.(
+				first_action_ts = first_ts,
+				last_action_ts = last_ts,
+
+				# MATH HACK 1: Seconds length is just max minus min
+				journey_length_s = last_ts_int - first_ts_int,
+
+				# MATH HACK 2: Days is just the seconds difference divided by 86,400
+				days_inactive = as.integer((user_cutoff_int - last_ts_int) / 86400),
+
+				total_actions = .N,
+
+				mean_gap_sec = if (.N > 1) mean(gap_s, na.rm = TRUE) else NA_real_,
+				median_gap_sec = if (.N > 1) fmedian(gap_s, na.rm = TRUE) else NA_real_,
+				max_gap_sec = if (.N > 1) max(gap_s, na.rm = TRUE) else NA_integer_
+			)
+		},
+		by = id
+	]
+
+  # CLEANUP: Remove the temporary math columns
+  events_dt[, c("ts_int", "cutoff_int", "gap_s") := NULL]
+
+	# 2. Wide Event Counts
+	counts <- dcast(
+		events_dt,
+		id ~ event_name,
+		value.var = "event_name",
+		fun.aggregate = length,
+		fill = 0
+	)
+	setnames(
+		counts,
+		setdiff(names(counts), "id"),
+		paste0("n_", setdiff(names(counts), "id"))
+	)
+
+	# 3. Merge and return
+	return(merge(summary_dt, counts, by = "id"))
+}
+```
+
+# Flatten test set
+
+```{r}
+#| label: flatten test set
+
+test_events <- dt[id %in% test_ids]
+test_events[, cutoff_time := max(event_timestamp)]
+test_flat <- flatten_journey(test_events)
+test_flat[, final_outcome := "incomplete"]
+
+write_parquet(test_flat, "test_features2.parquet")
+rm(test_events, test_flat); gc()
+```
+
+# Sample cut-points from train set
+
+## 1. Simple Sample
+
+-   single random cutpoint from each complete journey
+
+```{r}
+#| label: simple single sample
+# 1. Filter raw events for Train IDs
+train_events <- dt[id %in% train_ids]
+
+# 2. Generate exactly one random time cutoff per user
+set.seed(42)
+cutoffs <- train_events[,
+  .(
+    start_ts = min(event_timestamp),
+    end_ts = max(event_timestamp)
+  ),
+  by = id
+]
+
+# Generate a random timestamp between start and end
+cutoffs[,
+  random_cutoff := start_ts +
+    runif(.N) * as.numeric(difftime(end_ts, start_ts, units = "secs"))
+]
+
+# 3. Join the cutoffs back to the events and filter
+
+train_events <- train_events[cutoffs[, .(id, random_cutoff)], on = "id"]
+train_events_truncated <- train_events[event_timestamp <= random_cutoff]
+setnames(train_events_truncated, "random_cutoff", "cutoff_time")
+
+# 4. Flatten the truncated training data
+# Notice we pass 'random_cutoff' so days_inactive is calculated relative to the snapshot time
+train_flat <- flatten_journey(train_events_truncated)
+
+# 5. Bring in the true labels from step 1
+# We must use the TRUE final outcome we calculated earlier, not the truncated outcome!
+
+train_flat <- merge(train_flat, user_outcomes[id %in% train_ids], by = "id")
+
+saveRDS(train_flat, "train_features_simple_sample2.rds")
+
+rm(train_events, train_events_truncated, train_flat, cutoffs); gc()
+
+# train_feats <- readRDS("data/train_features_simple_sample.rds")
+
+# hist((train_feats$journey_length_s))
+
+# rm(train_feats); gc()
+```
+
+## 2. Sample proportional to total_actions
+
+```{r}
+#| label: generate K cutoffs
+
+train_events <- dt[id %in% train_ids]
+
+set.seed(42)
+
+# 1. Summarize user journeys to determine K
+snapshot_counts <- train_events[, .(
+  total_actions = .N,
+  start_ts      = event_timestamp[1],
+  end_ts        = event_timestamp[.N]
+), by = id]
+
+snapshot_counts <- merge(snapshot_counts, user_outcomes[, .(id, final_outcome)], by = "id")
+
+# 2. Define K: bounded between 1 and 5
+
+# frank(..., ties.method = "min") safely handles the heavy skew
+# It ranks users 1 to N, divides by N to get a percentile (0 to 1), multiplies by 5, and rounds up.
+snapshot_counts[, K := ceiling(5 * (frank(total_actions, ties.method = "min") / .N))]
+
+# 3. Expand the table: Duplicate rows so each user has K rows
+cutoffs <- snapshot_counts[rep(1:.N, K)]
+
+# 4. Generate random cutoffs and a unique snapshot_id
+cutoffs[, random_cutoff := start_ts + runif(.N) * as.numeric(difftime(end_ts, start_ts, units="secs"))]
+
+# Create a unique ID for each snapshot (e.g., "User123_1", "User123_2")
+cutoffs[, snapshot_id := paste0(id, "_", rowid(id))]
+```
+
+## 3. Sample proportional to journey_days
+
+```{r}
+#| label: generate K cutoffs per user based on journey_days
+
+train_events <- dt[id %in% train_ids]
+
+set.seed(13)
+
+# 1. Summarize user journeys to determine K
+snapshot_counts <- train_events[, .(
+  total_actions = .N,
+  start_ts      = event_timestamp[1],
+  end_ts        = event_timestamp[.N]
+), by = id][
+  , journey_days := as.numeric(
+    difftime(end_ts, start_ts, units="days"))]
+
+snapshot_counts <- merge(snapshot_counts, user_outcomes[, .(id, final_outcome)], by = "id")
+
+# 2. Define K: bounded between 1 and 5
+
+# frank(..., ties.method = "min") safely handles the heavy skew
+# It ranks users 1 to N, divides by N to get a percentile (0 to 1), multiplies by 5, and rounds up.
+snapshot_counts[, K := ceiling(5 * (frank(journey_days, ties.method = "min") / .N))]
+
+# 3. Expand the table: Duplicate rows so each user has K rows
+cutoffs <- snapshot_counts[rep(1:.N, K)]
+
+# 4. Generate random cutoffs and a unique snapshot_id
+cutoffs[, random_cutoff := start_ts + runif(.N) * as.numeric(difftime(end_ts, start_ts, units="secs"))]
+
+# Create a unique ID for each snapshot (e.g., "User123_1", "User123_2")
+cutoffs[, snapshot_id := paste0(id, "_", rowid(id))]
+```
+
+### join K cutoffs back to train_events
+
+```{r}
+#| label: join K cutoffs back to train_events
+
+# Duplicate the timestamp so it survives the join
+train_events[, event_ts_dup := event_timestamp]
+
+# Perform the Time Machine Join: Only keep events BEFORE the random cutoff
+train_events_expanded <- train_events[cutoffs[, .(id, snapshot_id, random_cutoff)], 
+                                      on = .(id, event_ts_dup <= random_cutoff), 
+                                      nomatch = NULL, 
+                                      allow.cartesian = TRUE]
+
+# Cleanup column names post-join
+setnames(train_events_expanded, "event_ts_dup", "cutoff_time") # The join condition column holds the cutoff timestamp
+
+# Rename snapshot_id to 'id' so your function treats each snapshot as a unique user
+setnames(train_events_expanded, "id", "original_user_id")
+setnames(train_events_expanded, "snapshot_id", "id")
+
+
+# Free up memory before flattening
+rm(train_events, cutoffs, snapshot_counts); gc()
+
+
+# Execute the flattening (This might take a few minutes depending on CPU)
+train_flat <- flatten_journey(train_events_expanded)
+
+
+
+# Rename 'id' back to 'snapshot_id' for clarity
+setnames(train_flat, "id", "snapshot_id")
+
+# extract the original ID out of the snapshot string
+train_flat[, id := sub("_[0-9]+$", "", snapshot_id)]
+
+# Add the final labels back to the flattened training data
+train_flat <- merge(train_flat, 
+                    user_outcomes[id %in% train_ids, .(id, final_outcome)], 
+                    by = "id")
+
+# Free up the expanded raw events
+rm(train_events_expanded); gc()
+
+# save k-cutoff sample
+write_parquet(train_flat, "train_features_kcut_sample2.parquet")
+```
+
+# Modeling
+
+```{r}
+#| label: setup
+#| include: false
+library(data.table)
+library(arrow)
+library(mlr3)
+library(mlr3tuning)
+library(mlr3learners)
+library(future)
+library(xgboost)
+```
+
+# Prep Data
+
+```{r}
+#| label: load data
+
+# ed_defs <- fread('data/Event Definitions.csv')
+train_flat <- setDT(read_parquet("train_features_kcut_sample2.parquet"))
+test_flat <- setDT(read_parquet("test_features2.parquet"))
+
+train_flat[, final_outcome := factor(final_outcome, levels = c("success", "failure"))]
+test_flat[, final_outcome := factor(final_outcome, levels = c("success", "failure"))]
+```
+
+## drop successes to reach 5%, keeping failures
+
+```{r}
+#| label: drop successes
+
+# 1. Physical Downsampling to 5% (1:19 ratio)
+successes <- train_flat[final_outcome == "success"]
+failures  <- train_flat[final_outcome == "failure"]
+
+# Failures / 19 = Number of successes needed to hit 5%
+n_target <- floor(nrow(failures) / 19)
+
+set.seed(42)
+train_flat_balanced <- rbind(
+  failures, 
+  successes[sample(.N, n_target)]
+)
+
+# Free up the heavy temporary tables
+rm(successes, failures, train_flat); gc()
+```
+
+## take toy sample (10% of train) with strat. sampling on outcome
+
+```{r}
+#| label: take toy sample
+
+train_dev <- train_flat_balanced[, .SD[sample(.N, max(1, .N * 0.10))], by = final_outcome]
+```
+
+# mlr3 setup
+
+## define classif task
+
+```{r}
+#| label: mlr3 setup
+
+# Setting positive = "success" is important for precision/recall metrics later
+tsk_train <- as_task_classif(
+  train_flat_balanced, 
+  target = "final_outcome", 
+  positive = "success",
+  id = "fh_model"
+)
+
+# Tell mlr3 that 'id' is a grouping factor, NOT a predictive feature
+tsk_train$set_col_roles("id", roles = "group")
+tsk_train$set_col_roles("snapshot_id", roles = "name")
+
+# Tell mlr3 that 'snapshot_id' is just a row name, NOT a predictive feature
+
+# drop leaky features
+leakers <- c(
+  'first_action_ts',
+  'last_action_ts',
+  'n_order_shipped',
+  'n_place_order_web',
+  "n_place_order_phone",
+  "n_place_downpayment",
+  "n_account_downpaymentreceived",
+  "n_account_downpaymentcleared",
+  'n_customer_requested_catalog_(digital)'
+)
+
+leakers <- intersect(leakers, tsk_train$feature_names)
+
+tsk_train$set_col_roles(
+  leakers,
+  remove_from = "feature"
+)
+
+# make subsample task
+
+tsk_dev <- as_task_classif(train_dev, target = "final_outcome", positive = "success")
+tsk_dev$set_col_roles("id", roles = "group")
+tsk_dev$set_col_roles("snapshot_id", roles = "name")
+tsk_dev$set_col_roles(leakers, remove_from = "feature")
+```
+
+## define learners and rsmp
+
+```{r}
+#| label: learners and rsmp
+lrn_rf <- lrn(
+	'classif.ranger',
+	id = 'randomForest_baseline',
+	predict_type = 'prob',
+	importance = 'impurity',
+	num.trees = 500
+)
+
+lrn_xgb <- lrn(
+	"classif.xgboost",
+	id = "xgboost_tuned",
+	predict_type = "prob",
+	nthread = 8,
+	booster = 'gbtree',
+	tree_method = 'hist'
+)
+
+search_space <- ps(
+	nrounds = p_int(lower = 50, upper = 300),
+	eta = p_dbl(lower = 0.05, upper = 0.3),
+	max_depth = p_int(lower = 3, upper = 8)
+)
+
+at_xgb <- auto_tuner(
+	tuner = tnr("random_search", batch_size = 10),
+	learner = lrn_xgb,
+	resampling = rsmp("holdout"),
+	measure = msr("classif.bbrier"),
+	search_space = search_space,
+	term_evals = 15 # 15 combinations is "light" but effective
+)
+
+# Standard Random Forest
+lrn_rf_base <- lrn(
+	"classif.ranger",
+	id = "RF_Baseline",
+	predict_type = "prob",
+	importance = "impurity",
+	num.trees = 100,
+	max.depth = 15,
+	num.threads = 8
+)
+
+# Standard XGBoost (No tuning)
+lrn_xgb_base <- lrn(
+	"classif.xgboost",
+	id = "XGB_Baseline",
+	predict_type = "prob",
+	nrounds = 100,
+	eta = 0.1,
+	max_depth = 6,
+	booster = 'gbtree',
+	tree_method = 'hist',
+	nthread = 8
+)
+```
+
+## base models
+
+```{r}
+#| label: base models
+
+rsmp_cv5 <- rsmp("cv", folds = 5)
+
+measures <- list(msr("classif.bbrier"), msr("classif.prauc"))
+```
+
+-   pred didnt work
+
+```{r}
+rr_xgb_dev <- resample(tsk_dev, lrn_xgb_base, rsmp_cv5)
+rr_xgb_dev$aggregate(measures)
+
+rr_rf_dev <- resample(tsk_dev, lrn_rf_base, rsmp_cv5)
+rr_rf_dev$aggregate(measures)
+
+lrn_xgb_base$train(tsk_dev)
+
+missing_cols <- setdiff(tsk_dev$feature_names, names(test_flat))
+
+test_flat[, (missing_cols) := 0]
+
+
+preds <- lrn_xgb_base$predict_newdata(test_flat)
+
+submission <- data.table(
+  id = test_flat$id,
+  order_shipped = preds$prob[, "success"]
+)
+
+
+```
+
+## tuning + bm
+
+```{r}
+plan(sequential)
+options(future.globals.maxSize = 2 * 1024^3)
+
+
+
+rsmp_cv5$instantiate(tsk_train)
+
+# rr_rf <- resample(tsk_train, lrn_rf_base, rsmp_cv5)
+rr_xgb <- resample(tsk_train, lrn_xgb_base, rsmp_cv5)
+rr_xgb$aggregate(measures)
+
+# TUNING WATCH OUT
+
+# rr_xgb_tuned <- resample(
+#   task = tsk_dev, 
+#   learner = at_xgb, 
+#   resampling = rsmp("cv", folds = 5) # Your standard grouped CV
+# )
+
+# rr_xgb_tuned$aggregate(measures)
+
+at_xgb$train(tsk_train)
+print(at_xgb$tuning_result)
+
+preds <- at_xgb$predict_newdata(test_flat)
+
+submission <- data.table(
+  id = test_flat$id,
+  order_shipped = preds$prob[, "success"]
+)
+
+# WAY too big for bmr...
+
+# design <- benchmark_grid(
+#   tasks = tsk_train,
+#   learners = list(lrn_rf, at_xgb),
+#   resamplings = rsmp("cv", folds = 5)
+# )
+
+# # Execute the benchmark
+# bmr <- benchmark(design)
+```
+
+```{r}
+library(vip)
+
+# Train model first
+lrn_rf_base$train(tsk_dev)
+
+# Extract underlying ranger model
+vip(lrn_rf_base$model) +
+  ggplot2::labs(
+    title = "Random Forest Variable Importance",
+    x = "Importance",
+    y = NULL
+  )
+
+lrn_rf_base$model$variable.importance
+```
+
+```{r}
+library(vip)
+
+lrn_xgb_base$train(tsk_dev)
+
+vip(lrn_xgb_base$model) +
+  ggplot2::labs(
+    title = "XGBoost Variable Importance",
+    x = "Importance",
+    y = NULL
+  )
+
+xgb.importance(model = lrn_xgb_base$model)
+```

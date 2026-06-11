@@ -1,0 +1,253 @@
+---
+title: 'FingerHut Modelling'
+author: 'Charlie Kopp'
+date: today
+date-format: long
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+    fig-align: center
+execute:
+  echo: true
+  warning: false
+  message: false
+
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(data.table)
+library(arrow)
+library(mlr3)
+library(mlr3tuning)
+library(mlr3learners)
+library(future)
+dir.create("results/submissions", recursive = TRUE, showWarnings = FALSE)
+```
+
+# Prep Data
+
+
+```{r}
+#| label: load data
+# ed_defs <- fread('data/event_definitions.csv')
+train_flat <- setDT(read_parquet("data/processed/train_features_kcut_sample.parquet"))
+test_flat <- setDT(read_parquet("data/processed/test_features.parquet"))
+
+train_flat[, final_outcome := factor(final_outcome, levels = c("success", "failure"))]
+test_flat[, final_outcome := factor(final_outcome, levels = c("success", "failure"))]
+```
+
+## drop successes to reach 5%, keeping failures
+
+```{r}
+#| label: drop successes
+
+# 1. Physical Downsampling to 5% (1:19 ratio)
+successes <- train_flat[final_outcome == "success"]
+failures  <- train_flat[final_outcome == "failure"]
+
+# Failures / 19 = Number of successes needed to hit 5%
+n_target <- floor(nrow(failures) / 19)
+
+set.seed(42)
+train_flat_balanced <- rbind(
+  failures, 
+  successes[sample(.N, n_target)]
+)
+
+# Free up the heavy temporary tables
+rm(successes, failures, train_flat); gc()
+```
+
+## take toy sample (10% of train) with strat. sampling on outcome
+
+```{r}
+#| label: take toy sample
+
+train_dev <- train_flat_balanced[, .SD[sample(.N, max(1, .N * 0.10))], by = final_outcome]
+```
+
+# mlr3 setup
+
+## define classif task
+
+```{r}
+#| label: mlr3 setup
+
+# Setting positive = "success" is important for precision/recall metrics later
+tsk_train <- as_task_classif(
+  train_flat_balanced, 
+  target = "final_outcome", 
+  positive = "success",
+  id = "fh_model"
+)
+
+# Tell mlr3 that 'id' is a grouping factor, NOT a predictive feature
+tsk_train$set_col_roles("id", roles = "group")
+
+# Tell mlr3 that 'snapshot_id' is just a row name, NOT a predictive feature
+tsk_train$set_col_roles("snapshot_id", roles = "name")
+
+# drop leaky features
+leakers <- c(
+  'first_action_ts',
+  'last_action_ts',
+  'n_order_shipped',
+  'n_place_order_web',
+  "n_place_order_phone",
+  "n_place_downpayment",
+  "n_account_downpaymentreceived",
+  "n_account_downpaymentcleared",
+  'n_customer_requested_catalog_(digital)'
+)
+
+tsk_train$set_col_roles(leakers, remove_from = "feature")
+
+
+# make subsample task
+
+tsk_dev <- as_task_classif(train_dev, target = "final_outcome", positive = "success")
+tsk_dev$set_col_roles("id", roles = "group")
+tsk_dev$set_col_roles("snapshot_id", roles = "name")
+tsk_dev$set_col_roles(leakers, remove_from = "feature")
+```
+
+## define learners and rsmp
+
+
+```{r}
+#| label: learners and rsmp
+lrn_rf <- lrn(
+	'classif.ranger',
+	id = 'randomForest_baseline',
+	predict_type = 'prob',
+	importance = 'impurity',
+	num.trees = 500
+)
+
+lrn_xgb <- lrn(
+	"classif.xgboost",
+	id = "xgboost_tuned",
+	predict_type = "prob",
+	nthread = 8,
+	booster = 'gbtree',
+	tree_method = 'hist'
+)
+
+search_space <- ps(
+	nrounds = p_int(lower = 50, upper = 300),
+	eta = p_dbl(lower = 0.05, upper = 0.3),
+	max_depth = p_int(lower = 3, upper = 8)
+)
+
+at_xgb <- auto_tuner(
+	tuner = tnr("random_search", batch_size = 10),
+	learner = lrn_xgb,
+	resampling = rsmp("holdout"),
+	measure = msr("classif.bbrier"),
+	search_space = search_space,
+	term_evals = 15 # 15 combinations is "light" but effective
+)
+
+# Standard Random Forest
+lrn_rf_base <- lrn(
+	"classif.ranger",
+	id = "RF_Baseline",
+	predict_type = "prob",
+	importance = "impurity",
+	num.trees = 100,
+	max.depth = 15,
+	num.threads = 8
+)
+
+# Standard XGBoost (No tuning)
+lrn_xgb_base <- lrn(
+	"classif.xgboost",
+	id = "XGB_Baseline",
+	predict_type = "prob",
+	nrounds = 100,
+	eta = 0.1,
+	max_depth = 6,
+	booster = 'gbtree',
+	tree_method = 'hist',
+	nthread = 8
+)
+```
+
+## base models
+
+```{r}
+#| label: base models
+
+rsmp_cv5 <- rsmp("cv", folds = 5)
+
+measures <- list(msr("classif.bbrier"), msr("classif.prauc"))
+
+rr_xgb_dev <- resample(tsk_dev, lrn_xgb_base, rsmp_cv5)
+rr_xgb_dev$aggregate(measures)
+
+rr_rf_dev <- resample(tsk_dev, lrn_rf_base, rsmp_cv5)
+rr_rf_dev$aggregate(measures)
+
+lrn_xgb_base$train(tsk_dev)
+preds <- lrn_xgb_base$predict_newdata(test_flat)
+
+submission <- data.table(
+  id = test_flat$id,
+  order_shipped = preds$prob[, "success"]
+)
+
+fwrite(submission, "results/submissions/sub1_xgb_dev.csv")
+```
+
+## tuning + bm
+
+```{r}
+plan(sequential)
+options(future.globals.maxSize = 2 * 1024^3)
+
+
+
+rsmp_cv5$instantiate(tsk_train)
+
+# rr_rf <- resample(tsk_train, lrn_rf_base, rsmp_cv5)
+rr_xgb <- resample(tsk_train, lrn_xgb_base, rsmp_cv5)
+rr_xgb$aggregate(measures)
+
+# TUNING WATCH OUT
+
+# rr_xgb_tuned <- resample(
+#   task = tsk_dev, 
+#   learner = at_xgb, 
+#   resampling = rsmp("cv", folds = 5) # Your standard grouped CV
+# )
+
+# rr_xgb_tuned$aggregate(measures)
+
+at_xgb$train(tsk_train)
+print(at_xgb$tuning_result)
+
+preds <- at_xgb$predict_newdata(test_flat)
+
+submission <- data.table(
+  id = test_flat$id,
+  order_shipped = preds$prob[, "success"]
+)
+
+fwrite(submission, "results/submissions/sub2_xgb_tuned_full.csv")
+
+# WAY too big for bmr...
+
+# design <- benchmark_grid(
+#   tasks = tsk_train,
+#   learners = list(lrn_rf, at_xgb),
+#   resamplings = rsmp("cv", folds = 5)
+# )
+
+# # Execute the benchmark
+# bmr <- benchmark(design)
+```

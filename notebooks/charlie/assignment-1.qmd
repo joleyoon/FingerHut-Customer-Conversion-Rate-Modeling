@@ -1,0 +1,146 @@
+---
+title: Assignment 1
+subtitle: STATS M148 FingerHut Project
+author: Charlie Kopp, Isaiah C. Mireles, Joel Yoon
+date: today
+date-format: long
+format:
+  pdf:
+    toc: false
+    number-sections: false
+    geometry:
+        - top=20mm
+        - left=20mm
+        - right=20mm
+        - heightrounded
+    execute:
+      echo: true
+      warning: false
+      message: false
+      include: false
+    fig-align: center
+    fig-height: 6
+    fig-width: 8
+---
+
+```{r}
+#| label: load packages
+#| include: false
+library(tidyverse)
+```
+
+
+# Task 0 - Fingerhut
+
+[Generated GPT](https://chatgpt.com/g/g-69cee2d550f4819195683c49639b978c-fingerhut-gpt)
+
+[Course Notes](https://docs.google.com/document/d/1k-IZ0ObDrfif1OiEVqaGXPZ5CbQxXZzn_GQ0rBYsBRE/edit?usp=sharing)
+
+# Task 1 - Read data
+
+```{r}
+#| label: load data
+data <- read_csv("C:/Users/charl/Desktop/UCLA/STATS M148/m148-project/data/dat_train1.csv")
+```
+
+```{r}
+#| label: basic summary stats
+
+nrow(data)
+data |> distinct(id) |> nrow() # num unique ids
+
+# earliest + latest timestamps
+min(data$event_timestamp)
+max(data$event_timestamp)
+```
+
+-   notice `id` feature is just **`customer_id account_id`**
+
+# Task 2 - Remove Duplicates
+
+- duplicates are when the same user logs the same action at the same time
+
+```{r}
+#| label: remove duplicates
+
+# get total count of duplicate rows
+data_unique <- data |> distinct(id, event_timestamp, event_name, .keep_all = TRUE)
+n_dupes <- nrow(data) - nrow(data_unique)
+n_dupes
+
+n_dupes / nrow(data) # proportion of total
+
+# count of clean rows
+nrow(data_unique)
+
+# actually delete duplicates
+data <- data_unique
+rm(data_unique)
+```
+
+# Task 3 - descriptive statistics 
+
+1. How long are typical journeys? Actual time and actions.
+2. What are common actions? Link the action IDs with the actual action
+descriptions to answer this question.
+3. How much time is between an individual user’s actions?
+4. etc.
+
+
+```{r}
+#| label: data manipulation
+
+# sample 10% of unique IDs to reduce memory usage
+set.seed(133)
+sampled_ids <- data |> distinct(id) |> slice_sample(prop = 0.1) |> pull(id)
+data <- data |> filter(id %in% sampled_ids)
+
+# 1. Journey lengths: time (in minutes) and total actions
+journey_summaries <- data |>
+	group_by(id) |>
+	summarize(
+		journey_duration_mins = as.numeric(difftime(max(event_timestamp), min(event_timestamp), units = "mins")),
+		total_actions = n(),
+		.groups = "drop"
+	)
+
+journey_stats <- journey_summaries |>
+	summarize(
+		mean_duration_mins = mean(journey_duration_mins, na.rm = TRUE),
+		median_duration_mins = median(journey_duration_mins, na.rm = TRUE),
+		mean_actions = mean(total_actions, na.rm = TRUE),
+		median_actions = median(total_actions, na.rm = TRUE)
+	)
+
+# 2. Most common actions
+common_actions <- data |>
+	count(event_name, ed_id, name = "frequency") |>
+	arrange(desc(frequency)) |>
+	slice_head(n = 10)
+
+# 3. Time between an individual user's actions
+time_between <- data |>
+	group_by(id) |>
+	arrange(event_timestamp, .by_group = TRUE) |>
+	mutate(
+		time_since_last_action = as.numeric(difftime(event_timestamp, lag(event_timestamp), units = "mins"))
+	) |>
+	ungroup() |>
+	filter(!is.na(time_since_last_action))
+
+time_between_stats <- time_between |>
+	summarize(
+		mean_time_btw_actions = mean(time_since_last_action, na.rm = TRUE),
+		median_time_btw_actions = median(time_since_last_action, na.rm = TRUE)
+	)
+
+# Bundle the summary objects into a single .RData file
+save(
+	journey_stats,
+	common_actions,
+	time_between_stats,
+	file = "C:/Users/charl/Desktop/UCLA/STATS M148/m148-project/data/sample_summary_stats.RData"
+)
+```
+
+# Task 4 - Flatten data (feature engineering)

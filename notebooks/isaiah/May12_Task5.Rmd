@@ -1,0 +1,92 @@
+---
+title: "Task 5"
+author: "Isaiah C. Mireles"
+date: "2026-05-12"
+output: html_document
+---
+
+# Task 3
+
+# Task 4
+
+## [Research Question]{.underline} : 
+
+-   What are the features differentiate `successful` / `Unsuccessful` / `Ongoing` Journeys + general observations
+
+[Definitions]{.underline} :
+
+-   **Successful Journey:** A journey that eventually ends with an `order_shipped` event. Regardless of how long the journey takes, if an order is shipped, the journey is considered successful.
+
+-   **Unsuccessful Journey:** A journey that does not end with an `order_shipped` event and has had no activity for at least 60 days before the cutoff date.
+
+-   **Ongoing (Incomplete) Journey:** A journey that has not ended with an `order_shipped` event, but whose most recent activity occurred within 60 days of the cutoff date, meaning the final outcome is still unknown.
+
+## [Report]{.underline} : 
+
+### **first to last action**
+
+-   Despite the typical user being on the cite for 134 days, `successful` users tend to be on the platform for much less time (48 days) – `Unsuccessful` for 170 days.
+
+    -   Meaning Journey duration varies substantially by outcome type.
+
+### **Time Between Actions**
+
+-   `successful` journeys have the shortest average time between actions (about 0.9 days on **avr**), suggesting that users who eventually purchase tend to move through the process relatively quickly.
+
+    -   `successful` journeys **median** Time Between Actions is only 90 seconds (1min, 30 sec), indicating dramatic skew
+
+    -   Indicating `successful` journeys typically make quick successive actions
+
+    -   Variability : `successful` journeys have a **SD** of 6 day – indicating a wide variability in user enagagment
+
+-   `Unsuccessful` journeys have much longer gaps between actions (about 5.6 days on **avr**), suggesting that disengaged users interact far less frequently over time.
+
+    -   `Unsuccessful` journeys **median** Time Between Actions is only 120 seconds (2min), indicating dramatic skew
+
+    -   Indicating `Unsuccessful` journeys typically make slower but still, successive actions
+
+    -   Variability : `Unsuccessful` journeys have a **SD** of 17 day – indicating dramatically more variability than `successful` journeys – suggesting that `Unsuccessful` journeys are far more likely to have longer periods of time of being off the website for longer periods of time. Suggesting those whom are `successful` journeys stay more consistently engaged
+
+### **Stage Counts**
+
+-   Across all journey types, the most common stage is **First Purchase**, indicating that most user activity centers around browsing, cart activity, and checkout behavior.
+
+-   `successful` journeys show substantially more activity in the **Downpayment** (533,281 \> 24,692 ) and **Credit Account** stages, suggesting these are strong signals of eventual conversion.
+
+-   `Unsuccessful` journeys have a much larger proportion of `NA` and **Apply for Credit** events, suggesting many users disengage before reaching later purchasing stages.
+
+-   The **Order Shipped** stage appears only in `successful` journeys, as expected, and represents the final conversion event.
+
+    -   Sanity Check\^
+
+### **Final Stage**
+
+-   Nearly all `successful` journeys end in the **Order Shipped** stage (about 99.5%), which confirms that successful users progress fully through the purchase funnel.
+
+    -   Sanity Check\^
+
+-   Ongoing journeys most commonly end in the **First Purchase** stage (about 47.6%), suggesting many active users are still browsing, shopping, or checking out.
+
+-   `Unsuccessful` journeys overwhelmingly end on events with missing (`NA`) stage labels (about 72%), indicating that many users disengage during promotional or uncategorized interactions before progressing further.
+
+-   Among categorized stages, `Unsuccessful` journeys most often stop during the **First Purchase** and **Apply for Credit** stages, suggesting that many users drop out before completing payment or shipment-related steps.
+
+-   Very few `Unsuccessful` or `Ongoing` journeys reach the **Downpayment** or **Credit Account** stages, implying that progressing deeper into the funnel is strongly associated with eventual success.
+
+### **Path Analysis using Stages** 
+
+-   `successful` journeys tend to follow structured progression paths that move through **Apply for Credit**, **First Purchase**, **Credit Account**, and **Downpayment** before ultimately reaching **Order Shipped**.
+
+-   Both `Ongoing` and `Unsuccessful` journeys are heavily concentrated in early funnel stages, especially **Apply for Credit** and **First Purchase**, suggesting many users never progress deeper into the purchasing pipeline & `Unsuccessful` users are those whom are repeatedly rejected after applying for credit.
+
+-   Repeated sequences such as long chains of **Apply for Credit** indicate that many users repeatedly interact with credit-related activities without converting.
+
+-   The presence of **Discover** stages is more common among `Ongoing` and `Unsuccessful` journeys, suggesting that many users remain in exploratory or marketing-related behaviors rather than advancing toward purchase completion.
+
+### **Down payment Stage** 
+
+-   Nearly all `successful` journeys (99.3%) reached the **Downpayment** stage, suggesting that progressing to downpayment activity is one of the strongest indicators of eventual order shipment success.
+
+-   Very few `Ongoing` (2.4%) or `Unsuccessful` (1.7%) journeys reached the Downpayment stage, indicating that most users who fail to convert never progress that deeply into the purchasing funnel.
+
+-   Downpayment stage appears to strongly separate successful journeys from non-successful journeys and is likely a highly predictive feature for future models.

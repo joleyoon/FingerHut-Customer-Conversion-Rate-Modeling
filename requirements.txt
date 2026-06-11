@@ -1,0 +1,9 @@
+matplotlib
+numpy
+pandas
+polars
+prophet
+pyarrow
+scikit-learn
+torch
+xgboost

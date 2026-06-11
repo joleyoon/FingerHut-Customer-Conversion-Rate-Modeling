@@ -1,0 +1,145 @@
+---
+title: 'RNN / Sequential Processing'
+subtitle: 'Stats M148 FingerHut Project - Second Round'
+author: 'Charlie Kopp'
+date: today
+date-format: long
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+    fig-align: center
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(arrow)
+library(data.table)
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+```
+
+## Introduction
+
+In our previous steps, we flattened user journeys into static feature vectors for modeling with Random Forest and XGBoost. This notebook implements **Step 1: Sequential Data Preparation** for sequence models (like LSTMs). 
+
+To optimize performance and maintain flexibility, we use **Apache Arrow (Parquet)**:
+1. **Sequential Indexing**: We map `event_name` to dense sequential integers (`1` to `N`), reserving `0` for padding.
+2. **Chronological Truncation**: We keep the last $M = 100$ events per user to capture the most recent context.
+3. **Single-Cutpoint Sampling**: To keep memory usage manageable, we sample one random cutpoint per complete user journey for training.
+4. **Cross-Platform Compatibility**: Parquet files can be read instantly in both R and Python.
+
+---
+
+## Load Data and Build Vocabulary Mapping
+
+```{r}
+#| label: load-raw-data
+
+# Load datasets
+dt <- setDT(read_parquet("data/processed/dt_clean2.parquet"))
+user_outcomes <- setDT(read_parquet("data/processed/user_outcomes2.parquet"))
+
+# Separate complete and incomplete user IDs
+test_ids <- user_outcomes[final_outcome == "incomplete", id]
+train_ids <- user_outcomes[final_outcome != "incomplete", id]
+
+# Build event vocabulary mapping
+unique_events <- sort(unique(dt$event_name))
+vocab_mapping <- data.table(
+  event_name = unique_events, 
+  event_idx = seq_along(unique_events)
+)
+
+write_parquet(vocab_mapping, "data/processed/vocab_mapping.parquet")
+```
+
+---
+
+## Sequential Data Preparation Function
+
+```{r}
+#| label: sequence-prep-function
+
+prepare_sequential_data <- function(events_dt, vocab_map, max_len = 100) {
+  setorder(events_dt, id, event_timestamp)
+  
+  # Calculate log-gaps
+  events_dt[, ts_numeric := as.numeric(event_timestamp)]
+  events_dt[, gap_s := ts_numeric - shift(ts_numeric), by = id]
+  events_dt[is.na(gap_s), gap_s := 0]
+  events_dt[, log_gap := log1p(gap_s)]
+  
+  # Map events
+  events_dt <- merge(events_dt, vocab_map, by = "event_name", all.x = TRUE)
+  
+  # Truncate
+  events_dt[, seq_rev_idx := rev(seq_len(.N)), by = id]
+  events_truncated <- events_dt[seq_rev_idx <= max_len]
+  
+  setorder(events_truncated, id, event_timestamp)
+  events_truncated[, seq_idx := seq_len(.N), by = id]
+  
+  output_dt <- events_truncated[, .(id, seq_idx, event_idx = event_idx, log_gap)]
+  
+  # Clean up memory
+  events_dt[, c("ts_numeric", "gap_s", "log_gap", "event_idx", "seq_rev_idx") := NULL]
+  
+  return(output_dt)
+}
+```
+
+---
+
+## Single Cutpoint Training Snapshots
+
+```{r}
+#| label: single-cutpoint-sampling
+
+# 1. Get journey bounds for training users
+train_bounds <- dt[id %in% train_ids, .(
+  start_ts = min(event_timestamp),
+  end_ts   = max(event_timestamp)
+), by = id]
+
+# 2. Generate exactly one random cutpoint per user
+set.seed(13)
+train_bounds[, random_cutoff := start_ts + runif(.N) * as.numeric(difftime(end_ts, start_ts, units="secs"))]
+
+# 3. Filter events to the cutpoint
+dt[, event_ts_dup := event_timestamp]
+train_events_subset <- dt[id %in% train_ids][
+  train_bounds[, .(id, random_cutoff)], 
+  on = .(id, event_ts_dup <= random_cutoff), 
+  nomatch = NULL
+]
+setnames(train_events_subset, "event_ts_dup", "cutoff_time")
+
+# Process Train Sequences
+print("Processing training sequences...")
+train_seq_dt <- prepare_sequential_data(train_events_subset, vocab_mapping, max_len = 100)
+
+# Merge labels
+train_seq_dt <- merge(
+  train_seq_dt, 
+  user_outcomes[, .(id, final_outcome)], 
+  by = "id"
+)
+
+write_parquet(train_seq_dt, "data/processed/train_lstm_sequences.parquet")
+rm(train_events_subset, train_seq_dt); gc()
+
+# Test Sequences
+print("Processing test sequences...")
+test_events <- dt[id %in% test_ids]
+test_events[, cutoff_time := max(event_timestamp)]
+test_seq_dt <- prepare_sequential_data(test_events, vocab_mapping, max_len = 100)
+
+write_parquet(test_seq_dt, "data/processed/test_lstm_sequences.parquet")
+rm(test_events, test_seq_dt); gc()
+```

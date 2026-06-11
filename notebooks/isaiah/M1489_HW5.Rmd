@@ -1,0 +1,1362 @@
+---
+title: "Finger Hut -- HW5"
+author: "Isaiah C. Mireles"
+date: "2026-05-06"
+output: html_document
+---
+
+```{r}
+setwd("/Users/isaiahmireles/Desktop/M148 GP")
+```
+
+```{r sh, warning =F}
+library(data.table)
+DT <- fread("clean_dat.csv")
+```
+
+# Task 3 – Time Series
+
+Create a time series for the number of orders shipped. Compute the number of orders shipped per day, week, and month.
+
+```{r}
+# Keep only rows with order shipped 
+DT_ship <- DT[event_name == "order_shipped"]
+nrow(DT_ship)
+```
+
+```{r sh2, message = F, warning = F}
+library(dplyr)
+# early - late
+DT_ship <- 
+  DT_ship |> arrange(dt_tm) 
+```
+
+## day_agg
+
+```{r}
+day_agg <- DT_ship |> group_by(date) |> count(event_name)
+
+plot(day_agg$date, day_agg$n)
+```
+
+```{r}
+range(day_agg$n)
+```
+
+## monthly_agg
+
+```{r sh3, message = F, warning = F}
+?summarise
+
+library(lubridate)
+monthly_agg <- 
+  DT_ship |>
+  mutate(month = floor_date(date, "month")) |> 
+  group_by(month) |>
+  count(event_name)
+
+plot(monthly_agg$month, monthly_agg$n)
+
+?floor_date
+```
+
+## yr_agg
+
+```{r}
+yr_agg <- 
+  DT_ship |>
+  mutate(year = floor_date(date, "year")) |> 
+  group_by(year) |>
+  count(event_name)
+
+plot(yr_agg$year, yr_agg$n)
+```
+
+```{r}
+#| label: setup
+#| include: false
+
+# install.packages(c("prophet", "data.table"))
+library(data.table)
+```
+
+# Data
+
+```{r}
+#| label: read data
+setwd("/Users/isaiahmireles/Desktop/M148 GP")
+dt <- fread("dat_train1.csv")
+dt2 <- fread("clean_dat.csv")
+```
+
+***Thomas Feedback:***
+
+-   predicting proportion of success based on first action date is too complicated. just make outcome the total orders shipped on any given day.
+-   also need to figure out how prophet handles missing data (no orders are shipped on weekends)
+
+## Total orders shipped per-day approach
+
+```{r}
+#| label: format data
+
+# just want to summarize data for total orders shipped per-day
+
+daily_data <- dt[, .(
+  y = sum(event_name=="order_shipped")
+), by = .(ds = as.IDate(event_timestamp))]
+
+# first couple weeks are all ZERO! in-progress orders were excluded
+# need to find a later start point - get avg length of successful journey and take pctile
+
+# any duplicate rows?
+# anyDuplicated(prophet_train_data$ds)
+```
+
+## Total orders shipped per-month
+
+```{r}
+#| label: monthly orders data
+
+prophet_train_data <- dt[
+  event_name == "order_shipped", 
+  .(ds = as.IDate(event_timestamp))] |>
+  _[, .(y = .N), by = .(ds = round(ds, "months"))]
+```
+
+## First-action date p-success approach
+
+```{r}
+#| label: format data (old)
+
+# drop incomplete rows
+
+train_cutoff_date <- as.IDate(max(dt$event_timestamp))
+
+# flatten data by user
+
+user_dt <- dt[, .(
+    first_action_date = as.IDate(min(event_timestamp)),
+    last_action_date = as.IDate(max(event_timestamp)),
+    has_shipped = any(event_name == "order_shipped"),
+    total_actions = .N
+), by = id]
+
+# define days since last action as days_inactive
+
+user_dt[, days_inactive := as.integer(train_cutoff_date - last_action_date)]
+
+user_dt[, journey_outcome := fcase(
+    has_shipped == TRUE, "success",
+    has_shipped == FALSE & days_inactive > 60, "failure",
+    default = "incomplete"
+)]
+
+table(user_dt$journey_outcome)
+
+# drop incomplete journeys
+
+user_dt_complete <- user_dt[journey_outcome != "incomplete", ]
+
+# want to find distr. journey length for a successes and add upper end to cutoff date to reduce survivorship bias
+
+successes_only <- user_dt_complete[journey_outcome == "success"]
+
+purchase_times <- dt[event_name == "order_shipped", 
+                     .(purchase_date = as.IDate(min(event_timestamp))), 
+                     by = id]
+
+# join back to find the journey length
+journey_lengths <- merge(successes_only, purchase_times, by = "id")
+journey_lengths[, days_to_buy := as.integer(purchase_date - first_action_date)]
+
+hist(journey_lengths$days_to_buy, breaks = 100, freq=FALSE)
+
+# find the 95th percentile of how long it takes people to buy
+p95_days_success <- quantile(journey_lengths$days_to_buy, probs = 0.95, na.rm = TRUE)
+print(paste("95% of successful users buy within", round(p95_days_success), "days"))
+
+p80_days_success <- quantile(journey_lengths$days_to_buy, probs = 0.80, na.rm = TRUE)
+
+# define safe cohort start date
+# Safe Date = Cutoff - (95th Percentile Days + 60 Days Inactivity)
+safe_cutoff <- train_cutoff_date - (round(p95_days_success) + 60)
+
+cohort_users <- user_dt_complete[first_action_date <= safe_cutoff]
+
+prophet_train_data <- cohort_users[, .(
+    total_users = .N,
+    successes = sum(journey_outcome == "success"),
+    y = sum(journey_outcome == "success") / .N # Prophet requires the target to be named 'y'
+), by = .(ds = first_action_date)] # Prophet requires the date to be named 'ds'
+```
+
+# Model fitting
+
+## fitting to orders-per-day
+
+```{r}
+#| label: fit prophet model to daily data
+
+library(prophet)
+
+# Initialize Prophet for daily data
+m <- prophet(
+  yearly.seasonality = TRUE,
+  weekly.seasonality = TRUE,
+  daily.seasonality = FALSE
+)
+m <- add_country_holidays(m, country_name = "US")
+m <- fit.prophet(m, prophet_train_data)
+
+# forecast through end of 2024:
+
+# calculate days needed to reach Dec 2024
+last_ds <- max(prophet_train_data$ds)
+n_days <- length(seq(last_ds, as.IDate("2024-12-01"), by = "day")) - 1
+
+# Create future dataframe at daily frequency
+future_daily <- make_future_dataframe(m, periods = max(0, n_days), freq = "day")
+forecast_daily <- predict(m, future_daily)
+```
+
+## fitting to orders-per-month
+
+```{r}
+#| label: fit prophet model to monthly data
+
+library(prophet)
+
+# Initialize Prophet for monthly data
+m <- prophet(
+  yearly.seasonality = TRUE,
+  weekly.seasonality = FALSE,
+  daily.seasonality = FALSE
+)
+
+m <- fit.prophet(m, prophet_train_data)
+
+# Calculate months needed to reach Dec 2024
+last_ds <- max(prophet_train_data$ds)
+n_months <- length(seq(last_ds, as.IDate("2024-12-01"), by = "month")) - 1
+
+# Create future dataframe at monthly frequency
+future_monthly <- make_future_dataframe(m, periods = max(0, n_months), freq = "month")
+forecast_monthly <- predict(m, future_monthly)
+```
+
+## fitting to cohort method
+
+```{r}
+#| label: fit prophet model
+
+library(prophet)
+
+m <- prophet(yearly.seasonality = TRUE, weekly.seasonality=TRUE)
+m <- add_country_holidays(m, country_name = "US")
+m <- fit.prophet(m, prophet_train_data)
+
+# calculate exactly how many days of "incomplete" cohorts we need to forecast
+days_to_forecast <- as.numeric(train_cutoff_date - safe_cutoff)
+
+# create a dataframe containing both historical dates AND future dates
+future_dates <- make_future_dataframe(m, periods = days_to_forecast)
+
+# generate the forecast
+# This creates a massive dataframe containing the prediction (yhat) and all components
+forecast <- predict(m, future_dates)
+```
+
+# Visualiations
+
+```{r}
+#| label: plotting
+
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+```
+
+### daily orders model
+
+```{r}
+#| label: daily plot
+
+plot(m, forecast_daily) +
+  labs(title = "Daily Orders Forecast through 2024", x = "Date", y = "Orders Shipped") +
+  theme_minimal()
+
+# ggsave("prophet-plots/daily_orders_forecast.png", width = 8, height = 4)
+
+# components
+
+comp_plot_list <- prophet_plot_components(m, forecast_daily)
+
+wrap_plots(comp_plot_list, ncol = 1, nrow=4) +
+  theme_minimal()
+
+# ggsave("prophet-plots/daily_orders_components.png", width = 8, height = 5)
+
+yoy_holiday_data <- forecast_daily %>%
+  select(ds, holidays) %>%
+  mutate(
+    # Extract the actual year to use as our color category
+    Year = as.factor(year(ds)),
+    
+    # Force every date to occur in 2024 (a leap year to protect Feb 29)
+    # This aligns 2022, 2023, and 2024 exactly on top of each other
+    dummy_date = update(ds, year = 2023)
+  )
+
+ggplot(yoy_holiday_data, aes(x = dummy_date, y = holidays, color = Year)) +
+  # Baseline zero line
+  geom_hline(yintercept = 0, color = "darkgray", linetype = "dashed") +
+  
+  # Draw the lines (alpha = 0.7 makes overlapping years easier to see through)
+  geom_line(linewidth = .5, alpha = 0.5) +
+  
+  # # Add dots only on the actual holidays
+  # geom_point(data = yoy_holiday_data %>% filter(holidays != 0), size = 1) +
+  
+  # Force the X-axis to label every single month using the dummy dates
+  scale_x_datetime(date_breaks = "1 month", date_labels = "%b") +
+
+  scale_color_brewer() +
+  
+  labs(
+    title = "Year-Over-Year Holiday Effect on Orders Shipped",
+    subtitle = "Baseline effect during US National Holidays",
+    x = "Month",
+    y = "Holiday Effect",
+    color = "Year"
+  ) +
+  theme_minimal()
+```
+
+## monthly model
+
+```{r}
+#| label: monthly plot
+
+library(ggplot2)
+library(dplyr)
+
+# Visualize monthly forecast
+plot(m, forecast_monthly) +
+  labs(title = "Monthly Orders Forecast through 2024", x = "Month", y = "Orders Shipped") +
+  theme_minimal()
+
+# Plot 1: The Main Forecast 
+plot(m, forecast) +
+  ggtitle("FingerHut Cohort Success Rate Forecast") +
+  xlab("Cohort Start Date") + 
+  ylab("Baseline Success Proportion") +
+  theme_minimal()
+
+# Plot 2: The Components Breakdown
+prophet_plot_components(m, forecast)
+
+# plot 3: zoom in on holiday year-over-year
+
+yoy_holiday_data <- forecast %>%
+  select(ds, holidays) %>%
+  mutate(
+    # Extract the actual year to use as our color category
+    Year = as.factor(year(ds)),
+    
+    # Force every date to occur in 2024 (a leap year to protect Feb 29)
+    # This aligns 2022, 2023, and 2024 exactly on top of each other
+    dummy_date = update(ds, year = 2023)
+  )
+
+ggplot(yoy_holiday_data, aes(x = dummy_date, y = holidays, color = Year)) +
+  # Baseline zero line
+  geom_hline(yintercept = 0, color = "darkgray", linetype = "dashed") +
+  
+  # Draw the lines (alpha = 0.7 makes overlapping years easier to see through)
+  geom_line(linewidth = .5, alpha = 0.7) +
+  
+  # Add dots only on the actual holidays
+  geom_point(data = yoy_holiday_data %>% filter(holidays != 0), size = 1) +
+  
+  # Force the X-axis to label every single month using the dummy dates
+  scale_x_datetime(date_breaks = "1 month", date_labels = "%b") +
+  
+  labs(
+    title = "Year-Over-Year Holiday Effect on Cohort Quality",
+    subtitle = "Baseline success rate multiplier during US National Holidays",
+    x = "Month",
+    y = "Holiday Effect",
+    color = "Cohort Year"
+  ) +
+  theme_minimal()
+```
+
+# Task 1
+
+# Configuring Data
+
+```{r}
+dt3 <- fread("dat_train1.csv")
+```
+
+## dt feature(s)
+
+```{r}
+dt3$date <- as.Date(dt3$event_timestamp) #only dt not time -- dt obj
+dt3$dt_tm <- as.POSIXct(dt3$event_timestamp, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+```
+
+### dt range
+
+```{r}
+range(dt3$date)
+range(dt3$dt_tm)
+```
+
+-   $$1$$ "2020-11-03" "2023-01-23"
+
+-   $$1$$ "2020-11-03 03:31:30 UTC" "2023-01-23 12:29:56 UTC"
+
+## counts – uniqueness
+
+```{r}
+length(unique(dt3$customer_id))
+```
+
+-   1,391,421 unique cust. id
+
+```{r}
+length(unique(dt3$account_id))
+```
+
+-   1,430,230 unique cust. id
+
+```{r}
+length(unique(dt3$id))
+```
+
+-   1,430,445 unique id (pasted)
+
+```{r}
+df <- dt3
+```
+
+### multi_customers_per_account
+
+```{r sh5, message=FALSE, warning = F}
+library(dplyr)
+multi_customers_per_account <- df %>%
+  distinct(customer_id, account_id) %>%
+  group_by(account_id) %>%
+  summarise(n_customers = n()) %>%
+  filter(n_customers > 1)
+
+# count how many such accounts
+nrow(multi_customers_per_account)
+
+# relative importance : negligible issue : frac of pct -- abt 0%
+round(nrow(multi_customers_per_account)/df %>%
+  distinct(customer_id, account_id) |> nrow(), 5)
+```
+
+### multi_accts_per_customer
+
+```{r}
+multi_accts_per_customer <- df %>%
+  distinct(customer_id, account_id) %>%   # remove duplicate rows first
+  group_by(customer_id) %>%
+  summarise(n_accounts = n()) %>%
+  filter(n_accounts > 1)
+
+# count how many such customers
+nrow(multi_accts_per_customer)
+
+
+# relative importance : almost negligible issue : 3%
+round(nrow(multi_accts_per_customer)/df |> 
+  distinct(customer_id, account_id) |> nrow(), 5)
+```
+
+# Remove Duplicates
+
+```{r}
+df <- df %>%
+  distinct(id, dt_tm, event_name, .keep_all = TRUE)
+```
+
+```{r}
+nrow(df)
+```
+
+-   correct\^
+-   This is the number of unique events, given a particular id for a given time
+
+### Number of customer, acct pairs
+
+```{r}
+df %>% summarize(count = n_distinct(customer_id, account_id))
+```
+
+-   There are 1,430,445 customer act pairs (not counting how the list of events they may take just counting how many unique pairs there are)
+
+# ct Journey Steps
+
+```{r}
+journeys <- df %>%
+  arrange(customer_id, account_id, dt_tm) %>%
+  group_by(customer_id, account_id) %>%
+  summarise(
+    event_names = list(event_name),
+    event_timestamps = list(dt_tm),
+    max_journey_steps_until_end = max(journey_steps_until_end),
+    .groups = "drop"
+  )
+```
+
+#### What do journeys look like?
+
+This is the sequence of events ordered by dt_tm of a particular customer_id, account_id pair?
+
+```{r}
+journeys$event_names[1:3]
+```
+
+### journey length (days)
+
+-   For each lst object : journeys\$event_timestamps
+
+-   look at each unique time stamp (ts)
+
+-   For time stamps with atleast 2
+
+-   subtract the last to the first entry and count in seconds
+
+-   otherwise label them NA as they contain less than 2
+
+```{r}
+journey_seconds <- sapply(
+  journeys$event_timestamps,
+  function(ts) {
+    if(length(ts) >= 2) {
+      as.numeric(ts[length(ts)] - ts[1], units = "secs")
+    } else {
+      NA
+    }
+  }
+)
+```
+
+```{r}
+mean_days <- mean(journey_seconds, na.rm=T) /(60*60*24)
+mean_days
+```
+
+-   There are typically about 136 days from start to end of someones journey
+
+-   different because i didnt sample – i used the whole thing
+
+## Typical Journey Length (num. actions)
+
+```{r}
+mean(journeys$max_journey_steps_until_end)
+```
+
+-   typically about 39 actions before someone reaches their last time step
+
+## Dist – Journey Length (num. actions)
+
+```{r shh100, warning = F}
+library(ggplot2)
+journeys |> ggplot(aes(max_journey_steps_until_end)) + geom_histogram(bins=50) 
+
+summary(journeys$max_journey_steps_until_end)
+```
+
+-   exp dist
+
+## Normalize :
+
+```{r}
+journeys |> ggplot(aes(max_journey_steps_until_end)) + geom_histogram(bins=50) + 
+  scale_x_log10()
+```
+
+-   sort of bi modal dist
+
+#### Does this differ by successful & unsuccessful journeys?
+
+```{r}
+journeys$order_shipped <- sapply(
+  journeys$event_names,
+  function(x) "order_shipped" %in% x
+)
+
+journeys |>
+  group_by(order_shipped) |>
+  summarise(
+    avg_journey_length = mean(max_journey_steps_until_end),
+    median_journey_length = median(max_journey_steps_until_end),
+    n = n()
+  )
+```
+
+-   notice that orders of those whom actually ship and order tends to be dramatically larger.
+
+### Amt of each action
+
+```{r}
+Amt_action <- df |> count(event_name) |> arrange(desc(n))
+Amt_action
+
+Amt_action |>
+  ggplot(aes(x = reorder(event_name, n), y = n)) +
+  geom_col() +
+  coord_flip()
+```
+
+```{r}
+Amt_action |> filter(event_name == "order_shipped")
+
+279363/sum(Amt_action$n) * 100
+```
+
+-   279,363 orders shipped – abt .53
+
+```{r}
+ev_def <- read.csv("Event Definitions.csv")
+```
+
+```{r}
+Amt_action |>
+  left_join(ev_def, by = "event_name") |> 
+  select(stage, event_name, n)
+```
+
+#### Typical Time between actions :
+
+```{r}
+gap_days <- unlist(
+  lapply(journeys$event_timestamps, function(ts) {
+
+    if(length(ts) >= 2) {
+
+      as.numeric(diff(ts), units = "days")
+
+    } else {
+
+      NULL
+    }
+  })
+)
+
+mean(gap_days) 
+
+quantile(gap_days, c(.5, .9, .99))
+```
+
+```{r}
+hist(gap_days, breaks = 100)
+```
+
+-   very heavily skewwed dist – usually around 0 days
+
+```{r}
+gap_sec <- unlist(
+  lapply(journeys$event_timestamps, function(ts) {
+
+    if(length(ts) >= 2) {
+
+      as.numeric(diff(ts), units = "secs")
+
+    } else {
+
+      NULL
+    }
+  })
+)
+hist(gap_sec, breaks = 1000)
+mean(gap_sec)
+quantile(gap_sec, c(.5, .9, .99))
+```
+
+-   Most actions happen very quickly after one another.
+
+-   But a small fraction of massive gaps heavily inflate the mean.
+
+-   About half are about a minute and a half after one another
+
+# **TLDR :**
+
+-   **Those whom ship an order are usually on website for longer**
+
+-   browse_products, view_cart, application_web_view, promotion_created, add_to_cart, begin_checkout are common user actions
+
+-   Shipping an order makes up a small portion of typical user actions
+
+-   The typical duration of a
+
+-   There are typically about 136 days from start to end of someones journey
+
+-   actions happen very quickly after one another.
+
+# Task 2
+
+A **complete journey** would be one where the journey ends with an order shipped. This means that no matter how long a journey takes, as long as it ends with a shipping of an order, it would be considered a successful journey. An **failed journey** would be a journey that with the cut off date in mind, at least 60 days before that cut off date the journeys did not have any activity. An **incomplete journey** would be one where the last activity was within the last 60 days that didn't end with the shipping
+
+```{r}
+cutoff_date <- max(df$event_timestamp) - as.difftime(60, units = "days")
+```
+
+-   starting from the last day going 60 days back, thats the cutoff date
+
+## Generate incomplete for journeys
+
+```{r}
+journeys$incomplete <- sapply(
+  seq_len(nrow(journeys)),
+  function(i) {
+
+    !("order_shipped" %in% journeys$event_names[[i]]) &&
+      (max(journeys$event_timestamps[[i]]) >= cutoff_date)
+
+  }
+)
+```
+
+```{r}
+table(journeys$incomplete)
+```
+
+```         
+incomplete
+False    1272120
+True      158325
+dtype: int64
+```
+
+-   same values!
+
+```{r}
+training_data <- journeys |>
+  filter(incomplete == FALSE)
+
+set.seed(123)
+
+train_df <- training_data |>
+  slice_sample(prop = 0.10)
+```
+
+## Generate Features :
+
+```{r}
+train_df$will_ship <- sapply(
+  train_df$event_names,
+  function(x) x[length(x)] == "order_shipped"
+)
+
+train_df$n_events <- sapply(train_df$event_names, length)
+
+train_df$n_unique_events <- sapply(
+  train_df$event_names,
+  function(x) length(unique(x))
+)
+
+train_df$journey_duration_days <- sapply(
+  train_df$event_timestamps,
+  function(x) as.numeric(max(x) - min(x), units = "days")
+)
+
+train_df$last_event_is_checkout <- sapply(
+  train_df$event_names,
+  function(x) as.integer(x[length(x)] == "begin_checkout")
+)
+
+train_df$n_add_to_cart <- sapply(
+  train_df$event_names,
+  function(x) sum(x == "add_to_cart")
+)
+
+train_df$n_begin_checkout <- sapply(
+  train_df$event_names,
+  function(x) sum(x == "begin_checkout")
+)
+
+train_df$n_view_cart <- sapply(
+  train_df$event_names,
+  function(x) sum(x == "view_cart")
+)
+```
+
+```{r}
+library(tidymodels)
+library(ranger)
+
+train_df$will_ship <- factor(train_df$will_ship)
+
+rf_spec <- rand_forest(
+  trees = 200
+) |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("classification")
+
+rf_fit <- rf_spec |>
+  fit(
+    will_ship ~ max_journey_steps_until_end +
+      n_events +
+      n_unique_events +
+      journey_duration_days +
+      last_event_is_checkout +
+      n_add_to_cart +
+      n_begin_checkout +
+      n_view_cart,
+    data = train_df
+  )
+
+rf_fit
+```
+
+```{r}
+preds <- predict(rf_fit, train_df) |>
+  bind_cols(train_df |> select(will_ship))
+
+accuracy(preds, truth = will_ship, estimate = .pred_class)
+```
+
+Previous scores from old assignment :
+
+```         
+OOB accuracy: 0.9737917806496242
+Training accuracy: 0.9998899474892305
+```
+
+-   notice we are getting similar values
+
+## Variable Importance
+
+```{r}
+library(vip)
+vip(rf_fit$fit) +
+  ggplot2::labs(
+    title = "Variable Importance",
+    x = "Importance",
+    y = NULL
+  )
+```
+
+![](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA1YAAAHWCAYAAAB0cxiaAAAAOnRFWHRTb2Z0d2FyZQBNYXRwbG90bGliIHZlcnNpb24zLjEwLjYsIGh0dHBzOi8vbWF0cGxvdGxpYi5vcmcvq6yFwwAAAAlwSFlzAAAPYQAAD2EBqD+naQAAV4NJREFUeJzt3Qm4TWX///Gv8ZiJZMqYeZYpKjSIkqIyh0r0VJJKgydlKiRKUY8eZaiIUBrMRI8kpBQSkqkSIXPm/b8+9++/9rX3cUbLOfsM79d17eucvffaa99rLWp/fO/7uzMEAoGAAQAAAAAuWMYLfykAAAAAQAhWAAAAAOATwQoAAAAAfCJYAQAAAIBPBCsAAAAA8IlgBQAAAAA+EawAAAAAwCeCFQAAAAD4RLACAAAAAJ8IVgAAJLOlS5dahgwZ3M/EuueeeyxXrlwJ2lbvMWDAgAsYIQAgsQhWAIB077bbbrMcOXLYkSNHYt2mU6dOljVrVtu/f7+lV6VKlbJbb73VUquffvrJBc3t27dHeigA0iCCFQAg3VNo+ueff+zjjz+O8fnjx4/bJ598Ys2bN7cCBQr4fr9GjRq599NPJG+wGjhwIMEKQJIgWAEA0j1VrHLnzm1TpkyJ8XmFqmPHjrkA5seJEyfs3LlzljFjRsuWLZv7iaTnnXcASEr8Fx0AkO5lz57d7rjjDlu8eLHt3bv3vOcVuBS8FMAOHDhgffr0sWrVqrm1Tnny5LGbb77ZfvjhhxjXUU2dOtX69etnxYoVc9MNDx8+HOMaq2XLllmbNm2sRIkSFhUVZcWLF7fHHnvMVbZi8uuvv1qzZs0sZ86cVrRoURs0aJAFAoF4j/X333+3++67zwoVKuTep0qVKjZ+/PgLOm+q/Og4RowYYW+88YaVKVPGHeNNN91ku3btcuMZPHiwXX755e4c33777e78xTS9cMGCBVazZk0XOCtXrmwfffRRjMesc5Q/f373PldddZXNnj07Qef99ddfd6+V6667zm0Teg0Unlu0aOHOpc7LFVdc4cZ+9uzZsP03adLEqlat6qpf2o/2rfcYPnx4jIFOUw/Lly/vjqtIkSLuz9nWrVuD2yjwjRo1yl0HbaPr8sADD9jff/99QdcEQORkjuB7AwCQYqgaNWnSJPvwww+tZ8+ewccVBObPn28dOnRw4WDDhg02a9Ys9yG9dOnStmfPHnvrrbescePG7sO2PpiH0odzrc1SGDt58qT7PSbTp093Uw4ffPBBN91w1apVNnr0aPvtt9/cc6H0YV/TEhUs9IF+3rx51r9/fztz5owLWLHRWPUaBQodY8GCBW3u3LnWrVs3F/h69+59Qedu8uTJdurUKXvkkUfc+dKY2rZta9dff70LLk8//bT98ssv7nh0HqIHuS1btli7du3sX//6l3Xt2tUmTJjgzq+Oq2nTpsGxN2zY0J2jXr16uXOk66WwO2PGDGvdunWc511hT69TwPr3v/9tlSpVctt5PydOnOiC8uOPP+5+fvHFF/b888+78/Lyyy+H7VuhR+dfIUnHqffXMSpsK2R710iBUWG9ffv29uijj7o1fAsXLrT169e74CYKUXrve++9141v27ZtNmbMGPv+++9t+fLlliVLlgu6JgAiIAAAAAJnzpwJFClSJNCgQYOwx8eOHasyUGD+/Pnu/okTJwJnz54N22bbtm2BqKiowKBBg4KPLVmyxL2uTJkygePHj4dt7z2nn57o28jQoUMDGTJkCOzYsSP4WNeuXd1rH3nkkeBj586dC7Ro0SKQNWvWwF9//RV8XNv1798/eL9bt27uGPft2xf2Pu3btw/kzZs3xjGEKlmypHuf0OPWexQsWDBw8ODB4ON9+/Z1j9eoUSNw+vTp4OMdOnRwY9Q5DN2ntp05c2bwsUOHDrlx1qpVK/hY79693XbLli0LPnbkyJFA6dKlA6VKlQpek7jO+/Tp0887756Yjv2BBx4I5MiRI2y8jRs3dvt49913g4+dPHkyULhw4cCdd94ZfGz8+PFuu1deeeW8/ep6iY5F20yePDns+Xnz5sX4OICUjamAAACYWaZMmVxlYcWKFWHNDTQNUNOzbrjhBndf08S8tVGqSqhLoCocFSpUsO++++68/aoCo0pXfEK30Xquffv2uQqN8pGqF9GFVtW8CpSqRosWLYpx/9rPzJkzrWXLlu537d+7aUrhoUOHYhx/Qqi6lDdv3uD9+vXru5933323Zc6cOexxjVHTEUOpyhdacdL0yi5durjj/vPPP91jc+bMsXr16tk111wT3E7nvUePHu56qVp4IefdE7qtKks6L9dee62rkP38889h2+p9dWweVcY0Nk1V9OhcX3rppa6KF52ul6gSqfOmqlzo9ahdu7Z7jyVLliR4/AAij2AF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3nmn/fDDD9apUycXQjZu3OieO336tDVr1swFi2XLltny5ctdWGjevLmdOnXKbaMwMXnyZJswYYJ7/vDhwwlatzVy5EgXiL7//nt76KGH7MEHH7RNmzbF+7qjR49a48aN7ffff7dPP/3UjVuhUmHJowCkMXz++efuppAybNiw4PMKVe+++66NHTvWBajHHnvM7r77bredaN+NGjWyqKgo++KLL2zNmjUuBCpERqfnmzZtai+++KILlRqHQtWBAwfc/nQdfv31V2vXrp0llAJVgwYNrHv37i746la8ePEYtz158qQ756E3AAAApA1MBUxm1atXt/79+7vfy5UrZ2PGjLHFixe7D/zxadOmjd1///3u98GDB7sgMHr0aHvzzTdt2rRpLii8/fbbrmoiClCqTi1dutRuuukmt23fvn2tdevW7nm995w5c+J931tuucUFKlEgefXVV23JkiVWoUKFOF83ZcoU++uvv1yVyJtiWLZs2bBtNOaJEye6QCidO3d250PhR0FE1bJFixa58CKq1H311Vf21ltvudD2xhtvuErX1KlTg2vDypcvf95YPv74Y+vSpYs7P15w0vusW7fOtm3bFgxDCnFVqlRxY65bt26850bvnTVrVsuRI4erQMZFIXHgwIHx7hMAAACpD8EqAsEqVJEiRWzv3r0Jeq0XLkLvr1271v2uatAvv/wSDCieEydOuKrQoUOH3BS3evXqBZ/LlCmT1a5dO6yCFN+YFdoUIBIyZo2tVq1aca7b0hTA0DGHng8dz/Hjx88LnarAab/ee2jqX1wNN1QdVDVMUwhDp/Wp2qdAFVphqly5sgujei4hwSoxFGoff/zx4H1VrGKrbgEAACB1IVgls+gBQEElvmCTEJp2p5CkqX7RaU1RJMasNVF+9q1jktmzZ1uxYsXCttPUv4S+xxVXXOHWlI0fP95atGiRqK6HGTNmtEAgEPaYpl1eCI3ZGzcAAADSFtZYpSLffPPNefcrVarkfr/yyitty5Ytdtlll7npdqE3TVfTrVChQm6Km+fs2bP23XffJdl4VelSRUlrmC6EqkcKImowEf2YvEqP3kNryuIKO5deeqlbX6UKmJpTeNvq3Knhh26en376yQ4ePOje2wulWjcVyqsSejQVUOcSAAAA6RfBKhWZPn26q7ps3rzZrdNatWqV9ezZ0z2nZhYKEGrGoKCh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AAAAAJ8IVgAAAADgE8EKAAAAAHwiWAEAAACATwQrAAAAAPCJYAUAAAAAPqX5YNWkSRPr3bt3pIeRqmzfvt0yZMhga9euTdL3GTBggNWsWTNJ3+Oee+6xVq1aJel7AAAAAGk+WKW2sJESwkXx4sVt9+7dVrVq1SQdV1pBeAcAAABfEIzzZMqUyQoXLhzpYQAAAACpRrqqWL333ntWp04dy507twsOHTt2tL179waf//vvv61Tp05WsGBBy549u5UrV84mTJjgnitdurT7WatWLVe5UpUiId5++22rVKmSZcuWzSpWrGhvvvlm8LmGDRva008/Hbb9X3/9ZVmyZLH//e9/7v7JkyetT58+VqxYMcuZM6fVr1/fli5dGtx+4sSJli9fPps/f757n1y5clnz5s1dxcmbbjdp0iT75JNP3Lh1C319QqpzcZ2X+Pz222/WoUMHy58/vxu/zv/KlSvPuy6lSpWyvHnzWvv27e3IkSPB586dO2dDhw5151/vXaNGDZsxY0bY6zds2GC33nqr5cmTx13ba6+91rZu3RrjeFavXu2O46WXXnL3d+7cabfffrs7b3p927Ztbc+ePXFW+1Sd8q6/nv/yyy/ttddeC55fnT8AAACkL+mqYnX69GkbPHiwVahQwQWqxx9/3H0wnjNnjnv+ueees59++snmzp1rl156qf3yyy/2zz//uOdWrVpl9erVs0WLFlmVKlUsa9as8b7f5MmT7fnnn7cxY8a4QPb9999b9+7dXcDo2rWrCyvDhw+3YcOGuQ/kMm3aNCtatKgLB9KzZ083pqlTp7rHP/74Yxec1q1b5wKOHD9+3EaMGOECSsaMGe3uu+92YUzvr58bN260w4cPB8OQQk5ixHVe4nL06FFr3LixC4WffvqpC7PfffedC0seBaBZs2bZ559/7gKcgo3Ox4svvuieV6h6//33bezYse54FTh1fApH2vfvv/9ujRo1ckHniy++cOFo+fLldubMmfPGo+fvuOMOd8579OjhxuGFKoUjvebhhx+2du3axRs+PQpUmzdvdtMmBw0a5B7T2GKikKybR9cEAAAAaUO6Clb33Xdf8PcyZcrY66+/bnXr1nUBQB+uVb1QAFJVRVRF8XgflgsUKJDgaXL9+/e3kSNHug/zoqqLAspbb73lgpVChKofX331VTBITZkyxVV4FLQ0HoUh/VSo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LFGtLgAk2NSpUwNRUVGBiRMnBn766adAjx49Avny5Qv8+eef7vnOnTsHnnnmmeD2y5cvD2TOnDkwYsSIwMaNGwP9+/cPZMmSJbBu3boIHkXalthrdPLkycD333/vbkWKFAn06dPH/b5ly5YIHkXaldjrM2zYsEDWrFkDM2bMCOzevTt4O3LkSASPIm1L7DUaMmRIYMGCBYGtW7e67fXfO/13b9y4cRE8irQtsdcoOroCpqzrM3DgwMD8+fPd36E1a9YE2rdvH8iWLVtgw4YNETwKeJgKCCSRdu3a2V9//WXPP/+8W4SqKS/6V3RvkerOnTvdlJjQedJTpkyxfv362b///W8rV66czZo1y6pWrRrBo0jbEnuN/vjjDzflInTKmW6NGzd2a3kQ2evzn//8x3XZuuuuu8L2o++HGTBgQLKPPz1I7DU6duyYPfTQQ26hffbs2V2FRAvwtR+kjGuElH19/v77b+vevbvbVl+EroqXvgezcuXKETwKeDIoXQXvAQAAAAASjX+iAAAAAACfCFYAAAAA4BPBCgAAAAB8IlgBAAAAgE8EKwAAAADwiWAFAAAAAD4RrAAAAADAJ4IVAAAAAPhEsAIAAAAAnwhWAACkQvfcc4+1atXKUqLt27dbhgwZbO3atZEeCgAkG4IVAAC4aE6dOhXpIQBARBCsAABI5Zo0aWKPPPKI9e7d2y655BIrVKiQjRs3zo4dO2b33nuv5c6d28qWLWtz584Nvmbp0qWuqjR79myrXr26ZcuWza666ipbv3592L5nzpxpVapUsaioKCtVqpSNHDky7Hk9NnjwYOvSpYvlyZPHevToYaVLl3bP1apVy72HxierV6+2pk2b2qWXXmp58+a1xo0b23fffRe2P23/9ttvW+vWrS1HjhxWrlw5+/TTT8O22bBhg916663u/XRs1157rW3dujX4vF5fqVIld0wVK1a0N9988yKebQCIGcEKAIA0YNKkSS6wrFq1yoWsBx980Nq0aWMNGzZ04eWmm26yzp072/Hjx8Ne9+STT7qwpNBTsGBBa9mypZ0+fdo9t2bNGmvbtq21b9/e1q1bZwMGDLDnnnvOJk6cGLaPESNGWI0aNez77793z2sMsmjRItu9e7d99NFH7v6RI0esa9eu9tVXX9k333zjQtMtt9ziHg81cOBA974//vije75Tp0524MAB99zvv/9ujRo1ckHviy++cGO877777MyZM+75yZMn2/PPP28vvviibdy40YYMGeLGpPMDAEkqAAAAUp2uXbsGbr/9dvd748aNA9dcc03wuTNnzgRy5swZ6Ny5c/Cx3bt3B/S//RUrVrj7S5YscfenTp0a3Gb//v2B7NmzB6ZNm+bud+zYMdC0adOw933yyScDlStXDt4vWbJkoFWrVmHbbNu2ze37+++/j/MYzp49G8idO3fgs88+Cz6m1/Xr1y94/+jRo+6xuXPnuvt9+/YNlC5dOnDq1KkY93nFFVcEpkyZEvbY4MGDAw0aNIhzLADgFxUrAADSAE3n82TKlMkKFChg1apVCz6m6YGyd+/esNc1aNAg+Hv+/PmtQoUKrtIj+nn11VeHba/7W7ZssbNnzwYfq1OnToLGuGfPHuvevburVGkqoKbyHT161Hbu3BnrseTMmdNt541bDTE09S9Llizn7V9THzUlsFu3bpYrV67g7YUXXgibKggASSFzkuwVAAAkq+hBQ2uVQh/TfTl37txFf2+Fn4TQNMD9+/fba6+9ZiVLlnTT+RTsoje8iOlYvHFnz5491v0rpInWl9WvXz/sOYVNAEhKBCsAANIxrXUqUaKE+/3vv/+2zZs3u8YPop/Lly8P2173y5cvH2dQyZo1q/sZWtXyXqtGElo3Jbt27bJ9+/YlaryqZmm9lNaBRQ9gqsoVLVrUfv31V7cuCwCSE8EKAIB0bNCgQW7aoELJs88+6xpgeN+P9cQTT1jdunVd17927drZihUrbMyYMfF22bvssstcZWnevHl2+eWXu+58mvqnKYDvvfeemzp4+PBh1zgjrgpUTHr27GmjR492DTX69u3r9qtwWK9ePTeNUY0vevXq5R5v3ry5nTx50r799lsXGh9//HFf5woA4sIaKwAA0rFhw4bZo48+arVr17Y///zTPvvss2DF6corr7QPP/zQpk6dalWrVnXd9hTE9OXEccmcObO9/vrr9tZbb7kK0u233+4ef+edd1zA0X7VoVABSCEsMRQC1Q1Q0/7Url3j1tQ/r3p1//33u3brEyZMcGvMtI26GHot4AEgqWRQB4sk2zsAAEiR9D1W1113nQs6+fLli/RwACDVo2IFAAAAAD4RrAAAAADAJ6YCAgAAAIBPVKwAAAAAwCeCFQAAAAD4RLACAAAAAJ8IVgAAAADgE8EKAAAAAHwiWAEAAACATwQrAAAAAPCJYAUAAAAA5s//AwC9jw1fQdI+AAAAAElFTkSuQmCC)
+
+-   notice we are getting the same features as equally important
+
+# Kaggle Prediction
+
+key point from **Task 3**
+
+-   The random forest associates more downpayment events with higher shipping probability
+
+```{r}
+getwd()
+oj <- fread("open_journeys1.csv")
+```
+
+## Generate Features
+
+```{r}
+train_df$n_place_downpayment <- sapply(train_df$event_names, function(x) sum(x == "place_downpayment"))
+
+train_df$n_place_order_web <- sapply(train_df$event_names, function(x) sum(x == "place_order_web"))
+
+train_df$n_place_order_phone <- sapply(train_df$event_names, function(x) sum(x == "place_order_phone"))
+
+train_df$last_is_promotion_created <- sapply(
+  train_df$event_names,
+  function(x) as.integer(x[length(x)] == "promotion_created")
+)
+
+train_df$n_promotion_created <- sapply(train_df$event_names, function(x) sum(x == "promotion_created"))
+
+train_df$n_application_web_approved <- sapply(train_df$event_names, function(x) sum(x == "application_web_approved"))
+
+train_df$n_browse_products <- sapply(train_df$event_names, function(x) sum(x == "browse_products"))
+
+train_df$n_application_web_view <- sapply(train_df$event_names, function(x) sum(x == "application_web_view"))
+
+train_df$n_campaign_click <- sapply(train_df$event_names, function(x) sum(x == "campaign_click"))
+
+train_df$n_application_web_submit <- sapply(train_df$event_names, function(x) sum(x == "application_web_submit"))
+
+train_df$n_campaignemail_clicked <- sapply(train_df$event_names, function(x) sum(x == "campaignemail_clicked"))
+
+train_df$last_is_place_order_phone <- sapply(
+  train_df$event_names,
+  function(x) as.integer(x[length(x)] == "place_order_phone")
+)
+
+train_df$last_is_campaign_click <- sapply(
+  train_df$event_names,
+  function(x) as.integer(x[length(x)] == "campaign_click")
+)
+
+train_df$last_is_begin_checkout <- sapply(
+  train_df$event_names,
+  function(x) as.integer(x[length(x)] == "begin_checkout")
+)
+```
+
+```{r}
+library(tidymodels)
+library(ranger)
+library(ggplot2)
+
+feature_cols <- c(
+  "max_journey_steps_until_end",
+  "n_place_downpayment",
+  "n_place_order_web",
+  "n_unique_events",
+  "n_place_order_phone",
+  "n_begin_checkout",
+  "journey_duration_days",
+  "last_is_promotion_created",
+  "n_add_to_cart",
+  "n_promotion_created",
+  "n_view_cart",
+  "n_events",
+  "n_application_web_approved",
+  "n_browse_products",
+  "n_application_web_view",
+  "n_campaign_click",
+  "n_application_web_submit",
+  "n_campaignemail_clicked",
+  "last_is_place_order_phone",
+  "last_is_campaign_click",
+  "last_is_begin_checkout"
+)
+
+train_df$will_ship <- factor(train_df$will_ship)
+
+rf_spec <- rand_forest(
+  trees = 150,
+  mtry = floor(sqrt(length(feature_cols))),
+  min_n = 10
+) |>
+  set_engine("ranger", importance = "impurity", seed = 42) |>
+  set_mode("classification")
+
+rf_fit_new <- rf_spec |>
+  fit(
+    as.formula(paste("will_ship ~", paste(feature_cols, collapse = " + "))),
+    data = train_df
+  )
+
+rf_fit_new
+```
+
+```{r}
+1 - rf_fit_new$fit$prediction.error
+```
+
+```{r}
+train_preds <- predict(rf_fit_new, train_df) |>
+  bind_cols(train_df |> select(will_ship))
+
+accuracy(
+  train_preds,
+  truth = will_ship,
+  estimate = .pred_class
+)
+```
+
+## Variable importance
+
+```{r}
+importance_df <- data.frame(
+  feature = names(rf_fit_new$fit$variable.importance),
+  importance = rf_fit_new$fit$variable.importance
+) |>
+  arrange(importance)
+
+importance_df |>
+  ggplot(aes(x = reorder(feature, importance), y = importance)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Variable Importance",
+    x = NULL,
+    y = "Importance"
+  )
+```
+
+## Cross Fold Validation
+
+```{r}
+library(tidymodels)
+library(ranger)
+library(ggplot2)
+
+set.seed(123)
+
+train_df$will_ship <- factor(train_df$will_ship)
+
+rf_formula <- as.formula(
+  paste("will_ship ~", paste(feature_cols, collapse = " + "))
+)
+
+folds <- vfold_cv(
+  train_df,
+  v = 5,
+  strata = will_ship
+)
+
+rf_spec <- rand_forest(
+  trees = 150,
+  mtry = floor(sqrt(length(feature_cols))),
+  min_n = 10
+) |>
+  set_engine("ranger", importance = "impurity", seed = 42) |>
+  set_mode("classification")
+
+rf_wf <- workflow() |>
+  add_model(rf_spec) |>
+  add_formula(rf_formula)
+
+rf_cv <- fit_resamples(
+  rf_wf,
+  resamples = folds,
+  metrics = metric_set(accuracy, roc_auc),
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+```{r}
+collect_metrics(rf_cv)
+```
+
+-   Model level metrics :
+
+```{r}
+collect_metrics(rf_cv, summarize = FALSE)
+```
+
+-   fold level data \^
+
+```{r}
+collect_metrics(rf_cv) |>
+  filter(.metric == "accuracy")
+```
+
+## Specificity
+
+```{r}
+rf_cv <- fit_resamples(
+  rf_wf,
+  resamples = folds,
+  metrics = metric_set(accuracy, roc_auc, sensitivity, specificity),
+  control = control_resamples(save_pred = TRUE)
+)
+
+collect_metrics(rf_cv)
+```
+
+-   Using 5-fold cross-validation, the random forest achieved 98.9% accuracy and 0.998 ROC AUC. Sensitivity and specificity were also high, suggesting strong performance on both shipped and non-shipped journeys. However, because the performance is extremely high, I would be cautious about possible leakage from variables that may encode future journey information, especially max_journey_steps_until_end.
+
+```{r}
+open_df <- journeys |>
+  filter(incomplete == TRUE)
+```
+
+```{r}
+add_rf_features <- function(dat) {
+  dat$n_events <- sapply(dat$event_names, length)
+  dat$n_unique_events <- sapply(dat$event_names, function(x) length(unique(x)))
+  dat$journey_duration_days <- sapply(dat$event_timestamps, function(x) {
+    as.numeric(max(x) - min(x), units = "days")
+  })
+
+  dat$n_place_downpayment <- sapply(dat$event_names, function(x) sum(x == "place_downpayment"))
+  dat$n_place_order_web <- sapply(dat$event_names, function(x) sum(x == "place_order_web"))
+  dat$n_place_order_phone <- sapply(dat$event_names, function(x) sum(x == "place_order_phone"))
+  dat$n_begin_checkout <- sapply(dat$event_names, function(x) sum(x == "begin_checkout"))
+  dat$n_add_to_cart <- sapply(dat$event_names, function(x) sum(x == "add_to_cart"))
+  dat$n_promotion_created <- sapply(dat$event_names, function(x) sum(x == "promotion_created"))
+  dat$n_view_cart <- sapply(dat$event_names, function(x) sum(x == "view_cart"))
+  dat$n_application_web_approved <- sapply(dat$event_names, function(x) sum(x == "application_web_approved"))
+  dat$n_browse_products <- sapply(dat$event_names, function(x) sum(x == "browse_products"))
+  dat$n_application_web_view <- sapply(dat$event_names, function(x) sum(x == "application_web_view"))
+  dat$n_campaign_click <- sapply(dat$event_names, function(x) sum(x == "campaign_click"))
+  dat$n_application_web_submit <- sapply(dat$event_names, function(x) sum(x == "application_web_submit"))
+  dat$n_campaignemail_clicked <- sapply(dat$event_names, function(x) sum(x == "campaignemail_clicked"))
+
+  dat$last_is_promotion_created <- sapply(dat$event_names, function(x) as.integer(x[length(x)] == "promotion_created"))
+  dat$last_is_place_order_phone <- sapply(dat$event_names, function(x) as.integer(x[length(x)] == "place_order_phone"))
+  dat$last_is_campaign_click <- sapply(dat$event_names, function(x) as.integer(x[length(x)] == "campaign_click"))
+  dat$last_is_begin_checkout <- sapply(dat$event_names, function(x) as.integer(x[length(x)] == "begin_checkout"))
+
+  dat
+}
+
+open_df <- add_rf_features(open_df)
+```
+
+```{r}
+pred_probs <- predict(rf_fit_new, open_df, type = "prob")
+pred_class <- predict(rf_fit_new, open_df)
+
+pred <- open_df |>
+  select(customer_id, account_id) |>
+  bind_cols(pred_probs, pred_class) |>
+  mutate(
+    id = paste(customer_id, account_id),
+    ship_probability = .pred_TRUE,
+    predicted_order_shipped = as.integer(.pred_class == "TRUE")
+  ) |>
+  select(id, ship_probability, predicted_order_shipped)
+```
+
+```{r}
+success_rate <- mean(pred$predicted_order_shipped)
+failure_rate <- 1 - success_rate
+
+success_rate
+failure_rate
+```
+
+# Kaggle Submission
+
+```{r}
+oj <- fread("open_journeys1.csv")
+
+oj$date <- as.Date(oj$event_timestamp)
+
+oj$dt_tm <- as.POSIXct(
+  oj$event_timestamp,
+  format = "%Y-%m-%dT%H:%M:%SZ",
+  tz = "UTC"
+)
+
+oj <- oj |>
+  distinct(id, dt_tm, event_name, .keep_all = TRUE)
+
+open_journeys <- oj |>
+  arrange(id, dt_tm) |>
+  group_by(id) |>
+  summarise(
+    event_names = list(event_name),
+    event_timestamps = list(dt_tm),
+    max_journey_steps_until_end = max(journey_steps_until_end),
+    .groups = "drop"
+  )
+```
+
+```{r}
+open_journeys <- add_rf_features(open_journeys)
+```
+
+```{r}
+pred_probs <- predict(
+  rf_fit_new,
+  open_journeys,
+  type = "prob"
+)
+```
+
+```{r}
+submission <- open_journeys |>
+  bind_cols(pred_probs) |>
+  transmute(
+    id,
+    order_shipped = .pred_TRUE
+  )
+```
+
+# write.csv(submission, "k_submission.csv", row.names = FALSE )
+
+```{r}
+sample_sub <- fread("open_journeys1_flattened_all0.csv")
+nrow(submission)
+nrow(sample_sub)
+
+all(submission$id == sample_sub$id)
+```
+
+# XGBoost
+
+```{r}
+library(xgboost)
+library(dplyr)
+
+# Training matrix
+x_train <- train_df |>
+  select(all_of(feature_cols)) |>
+  as.matrix()
+
+y_train <- ifelse(train_df$will_ship == "TRUE", 1, 0)
+
+# Test/open journey matrix
+x_test <- open_journeys |>
+  select(all_of(feature_cols)) |>
+  as.matrix()
+```
+
+```{r}
+set.seed(42)
+
+xgb_fit <- xgboost(
+  data = x_train,
+  label = y_train,
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  nrounds = 300,
+  max_depth = 4,
+  eta = 0.05,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  verbose = 0
+)
+```
+
+```{r}
+xgb_probs <- predict(xgb_fit, x_test)
+```
+
+```{r}
+submission_xgb <- open_journeys |>
+  transmute(
+    id = id,
+    order_shipped = xgb_probs
+  )
+
+
+nrow(submission_xgb)
+write.csv(submission_xgb, "submission_xgb.csv", row.names = FALSE)
+```
+
+# XGBoost2 feature_cols_no_leak
+
+```{r}
+feature_cols_no_leak <- setdiff(
+  feature_cols,
+  "max_journey_steps_until_end"
+)
+```
+
+```{r}
+# training matrix
+x_train_noleak <- train_df |>
+  select(all_of(feature_cols_no_leak)) |>
+  as.matrix()
+
+y_train <- ifelse(train_df$will_ship == "TRUE", 1, 0)
+
+# test/open matrix
+x_test_noleak <- open_journeys |>
+  select(all_of(feature_cols_no_leak)) |>
+  as.matrix()
+
+# fit model
+set.seed(42)
+
+xgb_fit_noleak <- xgboost(
+  data = x_train_noleak,
+  label = y_train,
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  nrounds = 300,
+  max_depth = 4,
+  eta = 0.05,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  verbose = 0
+)
+```
+
+```{r}
+xgb_probs_noleak <- predict(
+  xgb_fit_noleak,
+  x_test_noleak
+)
+```
+
+```{r}
+submission_xgb_noleak <- open_journeys |>
+  transmute(
+    id = id,
+    order_shipped = xgb_probs_noleak
+  )
+
+write.csv(
+  submission_xgb_noleak,
+  "submission_xgb_noleak.csv",
+  row.names = FALSE
+)
+```
+
+## Generate New Features
+
+```{r}
+train_df <- train_df |>
+  mutate(
+    checkout_rate = n_begin_checkout / pmax(n_events, 1),
+    cart_rate = n_add_to_cart / pmax(n_events, 1),
+    browse_to_cart = n_add_to_cart / (n_browse_products + 1)
+  )
+
+open_journeys <- open_journeys |>
+  mutate(
+    checkout_rate = n_begin_checkout / pmax(n_events, 1),
+    cart_rate = n_add_to_cart / pmax(n_events, 1),
+    browse_to_cart = n_add_to_cart / (n_browse_products + 1)
+  )
+```
+
+```{r}
+feature_cols_rates <- c(
+  feature_cols_no_leak,
+  "checkout_rate",
+  "cart_rate",
+  "browse_to_cart"
+)
+
+x_train_rates <- train_df |>
+  select(all_of(feature_cols_rates)) |>
+  as.matrix()
+
+x_test_rates <- open_journeys |>
+  select(all_of(feature_cols_rates)) |>
+  as.matrix()
+```
+
+```{r}
+set.seed(42)
+
+xgb_fit_rates <- xgboost(
+  data = x_train_rates,
+  label = y_train,
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  nrounds = 300,
+  max_depth = 4,
+  eta = 0.05,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  verbose = 0
+)
+```
+
+```{r}
+xgb_probs_rates <- predict(xgb_fit_rates, x_test_rates)
+
+submission_xgb_rates <- open_journeys |>
+  transmute(
+    id = id,
+    order_shipped = xgb_probs_rates
+  )
+
+write.csv(submission_xgb_rates, "submission_xgb_rates.csv", row.names = FALSE)
+```
+
+-   didnt improve model performance much
+
+## Generate New Features
+
+```{r}
+colnames(train_df)
+```

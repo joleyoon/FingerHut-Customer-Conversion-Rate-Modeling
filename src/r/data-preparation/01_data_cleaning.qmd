@@ -1,0 +1,128 @@
+---
+title: 'FingerHut Data Cleaning'
+author: 'Charlie Kopp'
+date: today
+date-format: long
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+    fig-align: center
+execute:
+  echo: true
+  warning: false
+  message: false
+
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(data.table)
+library(arrow)
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+```
+
+# Read Data
+
+```{r}
+#| label: read data
+
+dt <- fread("data/raw/dat_train2.csv")
+```
+
+# Init. inspection and clean
+
+```{r}
+#| label: init inspection
+
+# checking duplicates
+
+sum(duplicated(dt, by=c("id", "event_timestamp", "event_name"), fromLast = TRUE))
+sum(duplicated(dt, by=c("id", "event_timestamp", "event_name", "journey_steps_until_end"), fromLast = TRUE))
+
+# there are (~3mil) duplicate events taken by same user at same time, but they are registered as separate actions (i.e. "double clicks")
+
+# let's investigate:
+
+# ensure temporal order
+setorder(dt, id, event_timestamp)
+
+idx_duped <- duplicated(dt, by=c("id", "event_timestamp", "event_name"), fromLast = TRUE)
+
+# 1. Create a reference table of the duplicate keys
+dupe_keys <- dt[idx_duped, .(id, event_timestamp, event_name)]
+
+# 2. Use a join to pull all records matching those keys
+verification_sample <- dt[dupe_keys, on = .(id, event_timestamp, event_name)]
+
+# 3. View the first few sets
+head(verification_sample[order(id, event_timestamp)], 10)
+
+
+# Missing value summary
+na_summary <- dt[, lapply(.SD, \(x) sum(is.na(x)))] |>
+  melt(
+    measure.vars = names(dt),
+    variable.name = "column",
+    value.name = "na_count"
+  )
+na_summary[, pct_missing := round((na_count / nrow(dt)) * 100, 2)]
+na_summary
+
+# no missing values!
+
+# drop duplicates:
+dt <- unique(dt, by=c("id", "event_timestamp", "event_name"))
+
+# drop redundant / unused columns
+
+dt <- dt[,-c("customer_id", "account_id", "journey_steps_until_end", "sep")]
+```
+
+# create user outcome dt
+
+```{r}
+#| label: create user outcome dt
+train_cutoff_ts <- max(dt$event_timestamp)
+
+user_outcomes <- dt[,
+  .(
+    has_shipped = any(ed_id == 28),
+    last_ts = max(event_timestamp)
+  ),
+  by = id
+]
+
+user_outcomes[,
+  days_inactive := as.integer(difftime(
+    train_cutoff_ts,
+    last_ts,
+    units = "days"
+  ))
+]
+user_outcomes[,
+  final_outcome := fcase(
+    has_shipped == TRUE , "success" ,
+    days_inactive >= 60  , "failure" ,
+    default = "incomplete"
+  )
+]
+
+table(user_outcomes$final_outcome)
+
+# Keep only the essential mapping
+user_outcomes <- user_outcomes[, .(id, final_outcome)]
+```
+
+# save clean data
+
+```{r}
+#| label: save data
+
+write_parquet(dt, 'data/processed/dt_clean2.parquet')
+write_parquet(user_outcomes, "data/processed/user_outcomes2.parquet")
+
+rm(list=ls()); gc()
+```

@@ -1,0 +1,31 @@
+# Operating system and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# R and Quarto
+.Rhistory
+.RData
+.Rproj.user/
+*_cache/
+*.utf8.md
+*.knit.md
+
+# Private, generated, and large data
+data/raw/
+data/processed/
+results/
+*.parquet
+*.rds
+*.RData
+
+# Generated submissions and model artifacts
+*.pt
+*.npz
+submission*.csv
+open_journey_predictions.csv

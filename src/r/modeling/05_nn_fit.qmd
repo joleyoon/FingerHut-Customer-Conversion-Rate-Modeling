@@ -1,0 +1,184 @@
+---
+title: 'RNN / Sequential Processing'
+subtitle: 'Stats M148 FingerHut Project - Second Round'
+author: 'Charlie Kopp'
+date: today
+date-format: long
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+    fig-align: center
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(arrow)
+library(data.table)
+library(torch)
+dir.create("results/submissions", recursive = TRUE, showWarnings = FALSE)
+```
+
+## 1. Custom Dataset Class
+
+```{r}
+#| label: dataset-definition
+SequenceDataset <- dataset(
+  name = "SequenceDataset",
+  initialize = function(parquet_path, subsample = 1.0) {
+    raw_data <- as.data.table(read_parquet(parquet_path))
+
+    # Subsample
+    all_ids <- unique(raw_data$id)
+    if (subsample < 1.0) {
+      keep_ids <- sample(all_ids, floor(length(all_ids) * subsample))
+      raw_data <- raw_data[id %in% keep_ids]
+    }
+
+    # Pre-split data by user_id - massive speedup
+    self$user_data_list <- split(raw_data, by = "id")
+    self$user_ids <- names(self$user_data_list)
+    self$n_users <- length(self$user_ids)
+  },
+
+  .getitem = function(i) {
+    # Instantly grab the pre-filtered user data
+    user_data <- self$user_data_list[[i]]
+
+    event_seq <- torch_tensor(user_data$event_idx, dtype = torch_long())
+    gap_seq <- torch_tensor(user_data$log_gap, dtype = torch_float32())
+    label <- ifelse(user_data$final_outcome[1] == "success", 1.0, 0.0)
+
+    list(
+      x_event = event_seq,
+      x_gap = gap_seq,
+      y = torch_tensor(label, dtype = torch_float32())
+    )
+  },
+
+  .length = function() {
+    self$n_users
+  }
+)
+```
+
+## 2. Model and Collate Function
+
+```{r}
+#| label: model-definition
+LSTMModel <- nn_module(
+  "LSTMModel",
+  initialize = function(num_embeddings, embedding_dim, gap_dim, hidden_dim) {
+    self$embedding <- nn_embedding(num_embeddings + 1, embedding_dim)
+    with_no_grad({
+      self$embedding$weight[1, ]$zero_()
+    })
+    self$gap_linear <- nn_linear(1, gap_dim)
+    self$lstm <- nn_lstm(
+      input_size = embedding_dim + gap_dim,
+      hidden_size = hidden_dim,
+      batch_first = TRUE
+    )
+    self$classifier <- nn_linear(hidden_dim, 1)
+  },
+
+  forward = function(x_event, x_gap, lengths) {
+    x_emb <- self$embedding((x_event + 1)$to(dtype = torch_long()))
+    x_g <- self$gap_linear(x_gap$unsqueeze(-1))
+    x <- torch_cat(list(x_emb, x_g), dim = 3)
+
+    # Pack the sequence so the LSTM ignores the padding zeros
+    packed_x <- nn_utils_rnn_pack_padded_sequence(
+      x,
+      lengths,
+      batch_first = TRUE,
+      enforce_sorted = FALSE
+    )
+
+    out <- self$lstm(packed_x)
+
+    # Now this safely grabs the hidden state at the LAST VALID timestep
+    final_hidden <- out[[2]][[1]]$squeeze(1)
+    torch_sigmoid(self$classifier(final_hidden))
+  }
+)
+
+collate_batch <- function(batch) {
+  # Grab true lengths before padding
+  lengths <- sapply(batch, function(x) length(x$x_event))
+  max_len <- max(lengths)
+
+  x_event <- torch_stack(lapply(batch, function(x) {
+    pad <- torch_zeros(max_len, dtype = torch_long())
+    pad[seq_len(x$x_event$shape[1])] <- x$x_event
+    pad
+  }))
+
+  x_gap <- torch_stack(lapply(batch, function(x) {
+    pad <- torch_zeros(max_len, dtype = torch_float32())
+    pad[seq_len(x$x_gap$shape[1])] <- x$x_gap
+    pad
+  }))
+
+  y <- torch_stack(lapply(batch, function(x) x$y))
+
+  # Return lengths with the batch
+  list(x_event = x_event, x_gap = x_gap, lengths = lengths, y = y)
+}
+```
+
+## 3. Training and Inference
+
+```{r}
+#| label: training-fit
+
+num_embeddings <- max(read_parquet("data/processed/vocab_mapping.parquet")$event_idx)
+model <- LSTMModel(num_embeddings, 16, 4, 64)
+optimizer <- optim_adam(model$parameters, lr = 0.001)
+loss_fn <- nn_bce_loss()
+
+train_ds <- SequenceDataset("data/processed/train_lstm_sequences.parquet", subsample = 0.1)
+train_dl <- dataloader(train_ds, batch_size = 64, shuffle = TRUE, collate_fn = collate_batch)
+
+# Fit
+model$train()
+for (epoch in 1:5) {
+  coro::loop(for (batch in train_dl) {
+    optimizer$zero_grad()
+    preds <- model(batch$x_event, batch$x_gap, batch$lengths)
+    loss <- loss_fn(preds, batch$y$unsqueeze(-1))
+    loss$backward()
+    optimizer$step()
+  })
+}
+
+# Inference
+test_ds <- SequenceDataset("data/processed/test_lstm_sequences.parquet")
+test_dl <- dataloader(test_ds, batch_size = 64, collate_fn = collate_batch)
+model$eval()
+
+# Pre-allocate a list of the exact size needed
+pred_list <- vector("list", length(test_dl))
+batch_idx <- 1
+
+with_no_grad({
+  coro::loop(for (batch in test_dl) {
+    # Don't forget to pass batch$lengths from Step 2!
+    batch_preds <- as.array(model(batch$x_event, batch$x_gap, batch$lengths)$cpu())
+    
+    pred_list[[batch_idx]] <- batch_preds
+    batch_idx <- batch_idx + 1
+  })
+})
+
+# Flatten the list into a single vector all at once
+predictions <- unlist(pred_list)
+
+fwrite(data.table(id = test_ds$user_ids, order_shipped = predictions), "results/submissions/sub3_lstm1.csv")
+```
